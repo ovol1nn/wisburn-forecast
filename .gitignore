@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.pth
+*.onnx
+*.npy
+*.npz
+checkpoints/
+results/
+test_results/
+outputs/

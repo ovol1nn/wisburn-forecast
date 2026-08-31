@@ -1,0 +1,13 @@
+numpy==2.1.2
+pandas==2.3.3
+pyarrow==18.1.0
+openpyxl
+scikit-learn
+scipy
+matplotlib
+einops
+tqdm
+sympy
+PyWavelets
+statsmodels
+arch

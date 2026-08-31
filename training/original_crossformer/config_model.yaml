@@ -1,0 +1,110 @@
+data:
+  csv_path: "../data/data_0701.csv"
+  time_col: "time"
+  freq: "min"
+  series_cols: null
+  # 可选：目标序列变换开关（启用时：y_t <- y_{t-2} - y_t，然后再训练/评估；会丢弃前 2 行）
+  enable_target_lag2_minus_current: false
+  # 训练时允许作为输入的“非目标序列”白名单：
+  # - null：使用除 time_col 外的所有序列列（默认）
+  # - 列表：只输入这些非目标序列 + target_series（target_series 始终会被输入，不受此字段影响）
+  non_target_input_series:
+    - "8#炉一次风母管流量"
+    - "8#炉二次风母管流量"
+    - "一次风段1_占比"
+    - "一次风段2_占比"
+    - "一次风段3_占比"
+    - "一次风段5_占比"
+    - "一次风段6_占比"
+    - "一次风比例_一二次风量"
+    - "再循环风比例_二次风"
+    - "推料器行程"
+    - "干燥炉排行程"
+    - "燃烧炉排行程"
+    - "燃尽炉排行程"
+  target_series:
+    - "8#炉炉排上部垃圾料层厚度"
+    - "8#炉干燥炉排上部烟温"
+    - "8#炉炉膛上部温度"
+    - "8#炉省煤器出口烟气氧量"
+    - "8#炉出口蒸汽流量"
+
+model:
+  # Time-Series-Library 的模型名：Crossformer / iTransformer / TimeXer / TemporalFusionTransformer
+  name: "iTransformer"
+  # Time-Series-Library 的 --features（M/MS/S）
+  # - TimeXer：默认 MS（多变量输入 + 单目标输出，最后一列视为 target）
+  # - 其它模型：默认 M
+  # features: "MS"
+  seq_len: 60
+  pred_len: 15
+  label_len: 30
+  # Crossformer 的 patch/segment 长度（等价于其内部 seg_len）。默认 12（与原实现一致）。
+  # 也会通过 Time-Series-Library 的 --patch_len 传入。
+  patch_len: 3
+  d_model: 256
+  n_heads: 8
+  e_layers: 2
+  d_layers: 1
+  d_ff: 512
+  dropout: 0.1
+  factor: 3
+  inverse: true
+  des: "Exp"
+  # Crossformer：是否启用 decoder 占位符 mask embedding（默认 true）
+  use_dec_mask_embedding: true
+
+train:
+  epochs: 10
+  batch_size: 32
+  learning_rate: 1.0e-4
+  patience: 3
+  num_workers: 4
+  seed: 42
+  use_gpu: true
+  gpu: 0
+  use_amp: false
+  grad_clip_norm: 1.0
+
+loss:
+  eps: 1.0e-8
+  # 是否对“所有模型”都只在 target_series 这些维度上计算训练 loss（通过 Time-Series-Library 的 --loss_target_indices）
+  # - false（默认）：仅对 iTransformer/Crossformer 传该参数；TimeXer 默认不传，保持对全维度计算 loss
+  # - true：TimeXer 也会只对 target_series 这些维度计算 loss
+  use_target_indices_for_all_models: false
+  # 时间距离加权（训练集末尾越近权重越大）
+  time_weighting:
+    enabled: false
+    # 指数衰减系数，越大越强调靠近训练集末尾的样本
+    decay: 0.01
+    # 权重下限（避免极小权重）
+    min_weight: 0.0
+
+output:
+  dir: "./outputs"
+
+auto_search:
+  enabled: true
+  # 当 enabled=true 时：
+  # 1) 先按 space 执行随机搜索；
+  # 2) 搜索结束后默认使用“最优 trial 超参数”执行一次全量复训（train+val，即 0.8/0.0/0.2）；
+  # 3) run 根目录最终输出指向复训结果（replace_root）。
+  num_samples: 2
+  seed: 42
+  objective: "MAE_avg"
+  space:
+    d_model: [128, 256]
+    n_heads: [4, 8]
+    e_layers: [1, 2, 3]
+    d_layers: [1]
+    d_ff: [256, 512, 1024]
+    dropout: [0.1, 0.2]
+    factor: [3]
+    batch_size: [16, 32, 64]
+    epochs: [5, 10]
+    patience: [2, 3]
+    learning_rate:
+      min: 1.0e-4
+      max: 1.0e-2
+      log: true
+

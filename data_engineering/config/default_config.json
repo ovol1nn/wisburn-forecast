@@ -1,0 +1,79 @@
+{
+  "classification_xlsx": "../../../../assets/profiles/xingrong_3/points/point_classification.xlsx",
+  "classification_sheet": "模型变量明细",
+  "point_root": "../../../../assets/data/xingrong_3/silver/by_point",
+  "output_dir": "../../artifacts/forecast/data_engineering/outputs",
+  "default_freq_seconds": 1,
+  "max_wide_table_raw_gb": 6,
+  "models": ["子模型1", "子模型2"],
+  "missing_rate_warn": 0.3,
+  "constant_ratio_warn": 0.95,
+  "zero_abs_tolerance": 1e-9,
+  "zero_ratio_warn": 0.95,
+  "max_target_missing_rate_drop": 0.98,
+  "max_target_constant_ratio_drop": 0.98,
+  "min_target_non_null_rows": 1,
+  "drop_low_information_inputs": true,
+  "low_information_constant_ratio_drop": 0.98,
+  "low_information_zero_ratio_drop": 0.98,
+  "low_information_keep_point_codes": [],
+  "collective_missing_rate_warn": 0.4,
+  "min_valid_model_columns_rate": 0.65,
+  "training_exclusion_buffer_seconds": 3600,
+  "long_common_low_anomaly": {
+    "enabled": true,
+    "low_quantile": 0.08,
+    "low_margin_ratio": 0.08,
+    "common_low_rate_threshold": 0.25,
+    "rolling_seconds": 1800,
+    "min_duration_seconds": 21600,
+    "bridge_gap_seconds": 3600,
+    "min_candidate_columns": 5,
+    "max_candidate_missing_rate": 0.4,
+    "max_candidate_zero_ratio": 0.98,
+    "max_candidate_constant_ratio": 0.98
+  },
+  "window_seq_len": 1200,
+  "window_pred_len": 600,
+  "window_stride": 1,
+  "target_forward_fill_limit": 5,
+  "input_interpolate_limit": 6,
+  "input_forward_fill_limit": 30,
+  "model_overrides": {},
+  "pollutant_ranges": {
+    "SO2": [0, 300],
+    "NOx": [0, 500],
+    "NOX": [0, 500],
+    "O2": [0, 25],
+    "CO": [0, 2000]
+  },
+  "shutdown_indicators": [
+    {"point_code": "B3FT80", "name": "main_steam_flow", "min_running_value": 5, "missing_is_bad": false},
+    {"point_code": "B3FT00", "name": "primary_air_flow", "min_running_value": 5, "missing_is_bad": false},
+    {"point_code": "B3FT07", "name": "secondary_air_flow", "min_running_value": 5, "missing_is_bad": false}
+  ],
+  "derived_features": {
+    "primary_air_sections": [
+      {"name": "primary_air_section_1_flow", "sources": ["B3FT01A", "B3FT01B"]},
+      {"name": "primary_air_section_2_flow", "sources": ["B3FT02A", "B3FT02B"]},
+      {"name": "primary_air_section_3_flow", "sources": ["B3FT03A", "B3FT03B"]},
+      {"name": "primary_air_section_4_flow", "sources": ["B3FT04A", "B3FT04B"]},
+      {"name": "primary_air_section_5_flow", "sources": ["B3FT05A", "B3FT05B"]},
+      {"name": "primary_air_section_6_flow", "sources": ["B3FT06A", "B3FT06B"]}
+    ],
+    "secondary_air_flow": "B3FT07",
+    "recirculation_air_flow": null,
+    "pusher_position_sources": ["B3_GT00A", "B3_GT00B", "B3_GT00C"],
+    "grate_speed_groups": [
+      {"name": "drying_grate_speed_pv", "sources": ["B3_S01A_PV", "B3_S01B_PV"]},
+      {"name": "combustion_grate_speed_pv", "sources": ["B3_S02A_PV", "B3_S02B_PV"]},
+      {"name": "burnout_grate_speed_pv", "sources": ["B3_S03A_PV", "B3_S03B_PV"]}
+    ]
+  },
+  "valve_response_pairs": [
+    {"name": "secondary_air_fan_to_flow", "control": "B3HS14GT", "response": "B3FT07"},
+    {"name": "drying_grate_speed", "control": "B3_S01A_SV", "response": "B3_S01A_PV"},
+    {"name": "combustion_grate_speed", "control": "B3_S02A_SV", "response": "B3_S02A_PV"},
+    {"name": "burnout_grate_speed", "control": "B3_S03A_SV", "response": "B3_S03A_PV"}
+  ]
+}
