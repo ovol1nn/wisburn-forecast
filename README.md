@@ -97,20 +97,4 @@ $env:WISBURN_FORECAST_ARTIFACT_ROOT = "D:\wisburn-artifacts\forecast"
 
 ## GitHub 与协作
 
-创建私有仓库 `wisburn-forecast` 时，不要勾选 GitHub 的 README 或 `.gitignore`，因为本目录已提供。创建空仓库后：
-
-```powershell
-Set-Location "D:\code\pythonprojects\智慧焚烧\wisburn-platform\offline\forecast"
-git init
-git branch -M main
-git add .
-git status --short
-git diff --cached --stat
-git commit -m "feat: add xingrong3 forecast training module"
-git remote add origin https://github.com/<你的账号>/wisburn-forecast.git
-git push -u origin main
-```
-
-提交前确认暂存区中没有 `.parquet`、`.pth`、`.onnx`、`.npy`、`.zip`、虚拟环境或 `offline/artifacts/` 内容。数据和训练产物通过受控共享盘单独交付，并附数据版本与校验值。
-
 给合作者的要求很简单：只在本模块内修改数据构造、训练、评估和说明；从个人分支提交 Pull Request；每次实验说明数据版本、改动、逐目标结果和失败案例；不提交数据/权重。
