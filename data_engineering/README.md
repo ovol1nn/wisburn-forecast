@@ -1,6 +1,6 @@
 # 模型数据工程
 
-本目录把 `data_store/store/parquet/silver/by_point` 下的点位级数据处理成预测模型可用的数据集。当前模型 1 基线按 10 秒粒度构建，输入窗口 `120` 步，预测窗口 `60` 步；旧的 1 秒/1200 步示例仅用于遗留模型，不可用于替代当前模型 1。
+本目录把平台数据存储工具生成的 Silver 点位 Parquet 处理成预测模型数据集。模型 1 使用 10 秒粒度、`120→60`；模型 2 使用 1 秒粒度、`1200→600`。实际参数以脚本顶部交互参数和生成的 metadata 为准。
 
 ## VSCode 直接运行
 
@@ -48,13 +48,13 @@ INTERACTIVE_PRED_LEN = 60
 
 主要步骤：
 
-1. 从 `docs/点位治理与确认/数据资产/点位变量分类.xlsx` 的 `模型变量明细` 读取子模型输入/输出点位。
+1. 从配置的点位分类 Excel 中读取 `模型变量明细`；完整工程优先使用 Profile/数据资产提供的点位分类文件。
 2. 逐点读取 Silver Parquet，按右端点重采样，写入 `offline/artifacts/forecast/data_engineering/outputs/cache/resampled_<freq>s`，支持断点续跑。
 3. 拼接模型宽表，保留派生特征：一次风分段/占比、一次/二次风比例、推料器位置近似、炉排速度组均值等。
 4. 生成点位质量报告，统计缺失率、近零率、常值率。
 5. 对长期近零或常值的输入点位，写入低信息点报告，并从训练帧中剔除。
 6. 生成 `valid_for_training` mask：排除停炉/检修候选、集体异常、目标缺失、有效变量比例过低的时间点。
-7. 用 `valid_for_training` 生成滑动窗口索引，要求输入 1200 步和输出 300 步全程有效且时间连续。
+7. 用 `valid_for_training` 生成滑动窗口索引，窗口长度由模型参数决定，并要求输入段、预测段有效且时间连续。
 
 ## 检修和异常段
 
@@ -174,12 +174,12 @@ INTERACTIVE_PURGE_GAP_CHUNKS = 1
 
 ## 环境
 
-读写 parquet 需要 `duckdb`、`pyarrow`、`pandas`、`openpyxl`。当前项目的 `.venv_data_store` 中已有这些依赖，但由于中文路径下 venv 可能不能直接启动，建议用本机 Python 3.13 运行，脚本会自动复用 `.venv_data_store/Lib/site-packages`。
+读写 parquet 需要 `duckdb`、`pyarrow`、`pandas`、`openpyxl`。依赖由预测模块的数据工程环境提供；先把 `INTERACTIVE_ACTION` 改成 `check-env` 做环境检查，不要把虚拟环境或依赖目录提交到 Git。
 
 可以先把 `INTERACTIVE_ACTION` 改成 `check-env` 做环境检查。
 ## 对接原项目模型训练
 
-全量数据不要再导出单体 CSV 宽表。下一步使用分块窗口数据直接喂给 Time-Series-Library。当前模型 1 必须使用 10 秒、`seq_len=120`、`pred_len=60`；详细交付契约见 [训练规范](../../forecast/training/TRAINING_SPEC.md)：
+全量数据不要再导出单体 CSV 宽表。使用分块窗口数据直接喂给 Time-Series-Library。模型 1 使用 10 秒、`seq_len=120`、`pred_len=60`；模型 2 使用 1 秒、`seq_len=1200`、`pred_len=600`。
 
 1. 先运行 [chunked_tslib_dataset.py](../../forecast/training/chunked_tslib_dataset.py)，设置 `model1`、`freq_seconds=10`、`seq_len=120`、`label_len=60`、`pred_len=60`。脚本会生成：
    - `offline/artifacts/forecast/training_ready/model1_10s_seq120_pred60/metadata.json`

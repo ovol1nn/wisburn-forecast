@@ -77,7 +77,7 @@ offline/forecast/
 Silver 数据和点位分类表应放在仓库外的受控位置，例如：
 
 ```text
-D:\wisburn-data\xingrong_3\
+<external-data-root>/xingrong_3/
 ├─ silver\by_point\        # 每个点位一份 Parquet，例如 B3_F80.PV.parquet
 ├─ point_classification.xlsx
 └─ SHA256SUMS.txt           # 推荐：数据包校验值
@@ -86,9 +86,9 @@ D:\wisburn-data\xingrong_3\
 不要将 Silver Parquet、原始 CSV、checkpoint、ONNX、预测数组或压缩数据包复制到本目录或提交到 Git。单独使用本模块时，在 PowerShell 中设置本机路径：
 
 ```powershell
-$env:WISBURN_FORECAST_POINT_ROOT = "D:\wisburn-data\xingrong_3\silver\by_point"
-$env:WISBURN_FORECAST_CLASSIFICATION_XLSX = "D:\wisburn-data\xingrong_3\point_classification.xlsx"
-$env:WISBURN_FORECAST_ARTIFACT_ROOT = "D:\wisburn-artifacts\forecast"
+$env:WISBURN_FORECAST_POINT_ROOT = "<external-data-root>/xingrong_3/silver/by_point"
+$env:WISBURN_FORECAST_CLASSIFICATION_XLSX = "<external-data-root>/xingrong_3/point_classification.xlsx"
+$env:WISBURN_FORECAST_ARTIFACT_ROOT = "<external-artifact-root>/forecast"
 ```
 
 这些变量只指定本机文件路径，不涉及账号、密钥或 DCS。
@@ -100,7 +100,7 @@ $env:WISBURN_FORECAST_ARTIFACT_ROOT = "D:\wisburn-artifacts\forecast"
 3. 检查环境和路径：
 
    ```powershell
-   python offline/forecast/data_engineering/build_model_datasets.py check-env
+   python data_engineering/build_model_datasets.py check-env
    ```
 
 4. 在 `data_engineering/build_model_datasets.py` 顶部选择模型和时间参数，构造分块数据；再运行 `data_engineering/prepare_dataset_splits.py` 生成按时间顺序的训练、验证、测试切分。

@@ -5,4 +5,4 @@
 - `assets/data/xingrong_3/silver/by_point/`：按点位保存的 Silver Parquet；
 - `assets/profiles/xingrong_3/points/point_classification.xlsx`：唯一的点位和模型变量语义来源。
 
-若单独交接 `offline/forecast`，将上述两项通过受控存储提供，并在 `data_engineering/config/default_config.json` 中修改本地输入路径。数据到位后依次执行数据构造、时间切分和训练；大文件产物写入 `offline/artifacts/forecast/` 或 `WISBURN_FORECAST_ARTIFACT_ROOT` 指定的位置。
+若单独交接 `offline/forecast`，将上述两项通过受控存储提供，并通过环境变量 `WISBURN_FORECAST_POINT_ROOT`、`WISBURN_FORECAST_CLASSIFICATION_XLSX` 配置输入。数据到位后依次执行数据构造、时间切分和训练；大文件产物写入 `offline/artifacts/forecast/` 或 `WISBURN_FORECAST_ARTIFACT_ROOT` 指定的位置。
