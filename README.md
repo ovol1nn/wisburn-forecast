@@ -65,6 +65,7 @@ offline/forecast/
 ├─ training/          训练入口、数据桥接、训练规范
 ├─ tslib/             训练使用的 Crossformer / TSLib 源码
 ├─ contracts/         特征、目标和时间窗口契约
+├─ confidence/        当前发布模型的逐目标、逐时域置信度校准与图表
 ├─ reports/           离线预测效果与训练报告
 ├─ inputs/            外部 Silver 数据和点位表说明
 └─ tests/             路径与契约测试

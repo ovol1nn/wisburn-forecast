@@ -6,3 +6,5 @@
 - `generate_model1_10s_forecast_charts.py`：模型 1 十秒原生预测图。
 - `generate_smoothed_forecast_review.py`：原始预测、十秒聚合和历史 60 秒平滑的离线对比；60 秒平滑不进入控制链。
 - `generate_training_summary_doc.py`：训练成果 Word 汇总。
+
+当前运行版本的置信度校准不放在本目录，见 `../confidence/`。它按目标与时域输出经验预测区间、相对保持不变的动态收益和基础置信度，且不会修改模型权重或后端运行配置。
