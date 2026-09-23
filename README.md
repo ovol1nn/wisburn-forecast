@@ -29,7 +29,9 @@
 
 模型 2 的原始 600 个逐秒预测不会丢弃，保留给审计和离线排查。
 
-已完成的工作包括：训练数据构造、特征/目标/时间窗口校验、checkpoint 与 scaler 校验、ONNX 数值对齐，以及各目标 1、5、10 分钟预测效果的离线验收。已发布模型位于 `assets/models/xingrong_3/`（没有在此仓库下）；本目录只负责后续训练和改进。
+兴蓉 Profile 后续新增了主蒸汽压力（B3PT81A/B 均值）、主蒸汽温度（B3TE86B）、炉膛负压（B3PT04A/B 均值）、三路汽包水位（B3_DRUMLT1/2/3）和一次风预热器出口温度（B3TE03）作为理想控制目标。这七项目前只在厂区配置中，**尚未进入上表两套发布模型的输出**。Profile 已设置 `retrain_required: true`；后续应先检查 Silver 覆盖与点位质量，再更新目标定义、数据集、训练、逐目标验收及发布 bundle。不能把旧模型的输出解释成新目标预测。
+
+旧目标已完成训练数据构造、特征/目标/时间窗口校验、checkpoint 与 scaler 校验、可用版本的 ONNX 对齐以及逐目标离线验收。发布 bundle 在主工程的 `assets/models/xingrong_3/model1-10s-v20260823-r1/model1/` 和 `assets/models/xingrong_3/pred600-v20260809-r1/model2/`；本目录负责后续训练和改进。
 
 ## 当前最值得优化的问题
 
@@ -75,11 +77,18 @@ offline/forecast/
 
 ## 训练数据存放
 
-Silver 数据和点位分类表应放在仓库外的受控位置，例如：
+与主工程一起使用时，受控输入的默认位置为：
+
+```text
+assets/data/xingrong_3/silver/by_point/point_code=<点位编码>/data.parquet
+assets/profiles/xingrong_3/points/point_classification.xlsx
+```
+
+单独交付本子模块时，可以把同样内容放在仓库外的受控位置，例如：
 
 ```text
 <external-data-root>/xingrong_3/
-├─ silver\by_point\        # 每个点位一份 Parquet，例如 B3_F80.PV.parquet
+├─ silver/by_point/point_code=B3_F80.PV/data.parquet
 ├─ point_classification.xlsx
 └─ SHA256SUMS.txt           # 推荐：数据包校验值
 ```

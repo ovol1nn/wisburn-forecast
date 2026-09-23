@@ -2,6 +2,8 @@
 
 本目录把平台数据存储工具生成的 Silver 点位 Parquet 处理成预测模型数据集。模型 1 使用 10 秒粒度、`120→60`；模型 2 使用 1 秒粒度、`1200→600`。实际参数以脚本顶部交互参数和生成的 metadata 为准。
 
+当前发布模型仍各输出五个旧目标。兴蓉 Profile 后来新增的七个理想目标项尚未进入预测输出；重训时先核对点位主表和 Silver 覆盖，再生成新数据集，不能只改 Profile 的目标值。默认输入见 `assets/data/xingrong_3/silver/by_point/point_code=<点位>/data.parquet` 与 `assets/profiles/xingrong_3/points/point_classification.xlsx`；单独运行模块时可用 `WISBURN_FORECAST_POINT_ROOT` 和 `WISBURN_FORECAST_CLASSIFICATION_XLSX` 覆盖。
+
 ## VSCode 直接运行
 
 推荐直接打开 [build_model_datasets.py](build_model_datasets.py)，修改文件顶部的 `INTERACTIVE_*` 参数，然后在 VSCode 里点击运行 Python 文件。
@@ -26,7 +28,7 @@ INTERACTIVE_WINDOW_STRIDE = 1
 
 注意：全年 1 秒粒度的宽表会非常大，尤其是子模型1这种 300+ 点位的配置。脚本会先用 `max_wide_table_raw_gb` 估算宽表规模，超过阈值时提前停止，避免 pandas 合并过程中耗尽内存。要构建全年 1 秒训练样本，请启用 `INTERACTIVE_CHUNKED = True`，脚本会按 `INTERACTIVE_CHUNK_DAYS` 分块写训练帧，并为每块保留 `seq_len + pred_len` 所需的未来重叠区。这样不会生成一个全年单体宽表。
 
-如果 `INTERACTIVE_START` / `INTERACTIVE_END` 留空，分块输出写入全量目录，例如 `datasets/chunked/model2_1s_seq1200_pred300`。如果设置了短时间范围做测试，脚本会自动在目录名后增加时间后缀，避免覆盖全量 manifest。
+如果 `INTERACTIVE_START` / `INTERACTIVE_END` 留空，分块输出写入全量目录，例如模型 2 的 `datasets/chunked/model2_1s_seq1200_pred600`。如果设置了短时间范围做测试，脚本会自动在目录名后增加时间后缀，避免覆盖全量 manifest。旧的 `pred300` 目录是早期五分钟预测产物，不能用于当前十分钟模型。
 
 当前模型 1（全年 10 秒）推荐参数：
 
@@ -102,9 +104,9 @@ python "offline\forecast\data_engineering\build_model_datasets.py" audit-anomali
 - `cache/resampled_<freq>s/*.parquet`：逐点重采样缓存，可断点续跑。
 - `datasets/model*_1s.parquet`：模型宽表，保留原始清洗后的行。
 - `datasets/model*_training_frame_1s.parquet`：训练帧，包含 `valid_for_training`，并剔除长期近零/常值输入列。
-- `datasets/chunked/model*_1s_seq1200_pred300/frames/*.parquet`：分块训练帧；全年 1 秒训练推荐读取这里，而不是生成单个全年宽表。
-- `datasets/chunked/model*_1s_seq1200_pred300/windows/*_windows.csv`：每个分块对应的滑动窗口索引，窗口起点只落在该块核心时间段内。
-- `datasets/chunked/model*_1s_seq1200_pred300/manifest.csv`：分块清单，记录每块的核心时间、加载时间、训练帧路径、窗口索引路径、有效行数和窗口数。
+- `datasets/chunked/model1_10s_seq120_pred60/`、`datasets/chunked/model2_1s_seq1200_pred600/` 下的 `frames/*.parquet`：当前窗口口径的分块训练帧。
+- 上述目录的 `windows/*_windows.csv`：每个分块对应的滑动窗口索引，窗口起点只落在该块核心时间段内。
+- 上述目录的 `manifest.csv`：分块清单，记录每块的核心时间、加载时间、训练帧路径、窗口索引路径、有效行数和窗口数。
 - `reports/model*_quality_1s.csv`：模型点位质量报告。
 - `reports/low_information_inputs_model*_1s.csv`：长期近零/常值输入点位及剔除原因。
 - `reports/unusable_outputs_model*_1s.csv`：缺失率过高、无有效值或长期常值的输出点位；这些点位会从训练目标中剔除，避免一个不可用输出让整段窗口全部无效。
@@ -114,7 +116,7 @@ python "offline\forecast\data_engineering\build_model_datasets.py" audit-anomali
 - `reports/common_low_candidates_model*_1s.csv`：参与共识低位检测的候选变量及自适应低位阈值。
 - `reports/common_low_score_model*_1s.parquet`：逐时间点共识低位得分。
 - `reports/invalid_training_windows_model*_1s.csv`：应用 buffer 后不可训练窗口。
-- `reports/window_index_model*_1s_seq1200_pred300.csv`：滑动窗口索引，包含输入段和预测段的起止行号/时间。
+- `reports/window_index_model*_<频率>s_seq<输入点数>_pred<预测点数>.csv`：滑动窗口索引，包含输入段和预测段的起止行号/时间。
 - `reports/valve_response_diagnostics_model*_1s.csv`：控制量和响应量的相关性/单调性诊断。
 
 ## 测试结果可视化
@@ -125,7 +127,7 @@ python "offline\forecast\data_engineering\build_model_datasets.py" audit-anomali
 INTERACTIVE_MODEL = "子模型2"
 INTERACTIVE_FREQ_SECONDS = 1
 INTERACTIVE_SEQ_LEN = 1200
-INTERACTIVE_PRED_LEN = 300
+INTERACTIVE_PRED_LEN = 600
 INTERACTIVE_PREVIEW_COLUMNS = [
     "B3FT80",
     "B3FT00",
@@ -156,14 +158,14 @@ INTERACTIVE_PREVIEW_COLUMNS = [
 INTERACTIVE_MODEL_SLUG = "model2"
 INTERACTIVE_FREQ_SECONDS = 1
 INTERACTIVE_SEQ_LEN = 1200
-INTERACTIVE_PRED_LEN = 300
+INTERACTIVE_PRED_LEN = 600
 INTERACTIVE_TRAIN_RATIO = 0.70
 INTERACTIVE_VAL_RATIO = 0.15
 INTERACTIVE_TEST_RATIO = 0.15
 INTERACTIVE_PURGE_GAP_CHUNKS = 1
 ```
 
-输出位于 `datasets/chunked/model*_1s_seq1200_pred300/splits`：
+输出位于所选模型和时间参数对应的 `datasets/chunked/<模型>_<频率>s_seq<输入点数>_pred<预测点数>/splits`：
 
 - `split_manifest.csv`：所有可用 chunk 的 split 标记。
 - `train_chunks.csv`、`val_chunks.csv`、`test_chunks.csv`：训练脚本应读取的分块清单。
