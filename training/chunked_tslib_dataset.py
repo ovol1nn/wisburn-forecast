@@ -15,30 +15,61 @@ from typing import Any, Iterator
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = SCRIPT_DIR.parents[2]
-DATA_ENGINEERING_DIR = Path(os.environ.get(
-    "WISBURN_DATA_ENGINEERING_ROOT",
+DATA_ENGINEERING_ROOT_OVERRIDE = os.environ.get("WISBURN_DATA_ENGINEERING_ROOT")
+DATA_ENGINEERING_CANDIDATES = [
     WORKSPACE_ROOT / "offline" / "forecast" / "data_engineering",
-))
+    WORKSPACE_ROOT / "backend" / "pipeline" / "model_data_engineering",
+]
+if DATA_ENGINEERING_ROOT_OVERRIDE:
+    DATA_ENGINEERING_DIR = Path(DATA_ENGINEERING_ROOT_OVERRIDE)
+else:
+    DATA_ENGINEERING_DIR = next(
+        (path for path in DATA_ENGINEERING_CANDIDATES if (path / "config" / "default_config.json").exists()),
+        DATA_ENGINEERING_CANDIDATES[0],
+    )
 ARTIFACT_ROOT = Path(os.environ.get(
     "WISBURN_FORECAST_ARTIFACT_ROOT",
     WORKSPACE_ROOT / "offline" / "artifacts" / "forecast",
 ))
+DATASET_OUTPUT_ROOT_OVERRIDE = os.environ.get("WISBURN_FORECAST_DATASET_OUTPUT_ROOT")
+DEFAULT_DATASET_OUTPUT_ROOTS = [
+    ARTIFACT_ROOT / "data_engineering" / "outputs",
+    DATA_ENGINEERING_DIR / "outputs",
+    WORKSPACE_ROOT / "backend" / "pipeline" / "model_data_engineering" / "outputs",
+]
+TRAINING_READY_ROOT_OVERRIDE = os.environ.get("WISBURN_FORECAST_TRAINING_READY_ROOT")
+if TRAINING_READY_ROOT_OVERRIDE:
+    TRAINING_READY_ROOT = Path(TRAINING_READY_ROOT_OVERRIDE)
+elif SCRIPT_DIR.name == "model_training":
+    TRAINING_READY_ROOT = SCRIPT_DIR / "outputs" / "training_ready"
+else:
+    TRAINING_READY_ROOT = ARTIFACT_ROOT / "training_ready"
 DEFAULT_CONFIG = DATA_ENGINEERING_DIR / "config" / "default_config.json"
 if str(DATA_ENGINEERING_DIR) not in sys.path:
     sys.path.insert(0, str(DATA_ENGINEERING_DIR))
 
 # VSCode interactive defaults.
 # Edit these values, then click "Run Python File" in VSCode.
-INTERACTIVE_MODEL_SLUG = "model3"  # model1 | model2 | model3
-INTERACTIVE_FREQ_SECONDS = 1
-INTERACTIVE_SEQ_LEN = 1200
-INTERACTIVE_LABEL_LEN = 600
-INTERACTIVE_PRED_LEN = 600
+INTERACTIVE_MODEL_SLUG = "model1"  # model1 | model2
+INTERACTIVE_FREQ_SECONDS = 10
+INTERACTIVE_SEQ_LEN = 120
+INTERACTIVE_LABEL_LEN = 60
+INTERACTIVE_PRED_LEN = 60
 INTERACTIVE_BATCH_SIZE = 16
 INTERACTIVE_NUM_WORKERS = 0
 INTERACTIVE_CACHE_SIZE = 4
 INTERACTIVE_MAX_SMOKE_WINDOWS = 512
-INTERACTIVE_FORCE_REFIT_SCALER = False
+INTERACTIVE_FORCE_REFIT_SCALER = True
+
+
+def dataset_output_root_for(dataset_id: str) -> Path:
+    if DATASET_OUTPUT_ROOT_OVERRIDE:
+        return Path(DATASET_OUTPUT_ROOT_OVERRIDE)
+    dataset_dir = Path("datasets") / "chunked" / dataset_id
+    for output_root in DEFAULT_DATASET_OUTPUT_ROOTS:
+        if (output_root / dataset_dir).exists():
+            return output_root
+    return DEFAULT_DATASET_OUTPUT_ROOTS[0]
 
 
 def maybe_add_project_site_packages() -> None:
@@ -130,18 +161,17 @@ def model_dataset_id(model_slug: str, freq_seconds: int, seq_len: int, pred_len:
 
 
 def chunk_root_for(model_slug: str, freq_seconds: int, seq_len: int, pred_len: int) -> Path:
-    return DATA_ENGINEERING_DIR / "outputs" / "datasets" / "chunked" / model_dataset_id(
-        model_slug, freq_seconds, seq_len, pred_len
-    )
+    dataset_id = model_dataset_id(model_slug, freq_seconds, seq_len, pred_len)
+    return dataset_output_root_for(dataset_id) / "datasets" / "chunked" / dataset_id
 
 
 def training_ready_dir_for(model_slug: str, freq_seconds: int, seq_len: int, pred_len: int) -> Path:
-    return ARTIFACT_ROOT / "training_ready" / model_dataset_id(model_slug, freq_seconds, seq_len, pred_len)
+    return TRAINING_READY_ROOT / model_dataset_id(model_slug, freq_seconds, seq_len, pred_len)
 
 
 def stored_paths_for(dataset_id: str) -> dict[str, str]:
     return {
-        "chunk_root": str(DATA_ENGINEERING_DIR / "outputs" / "datasets" / "chunked" / dataset_id),
+        "chunk_root": str(dataset_output_root_for(dataset_id) / "datasets" / "chunked" / dataset_id),
         "adapter_py": str(SCRIPT_DIR / "chunked_tslib_dataset.py"),
         "metadata_json": "metadata.json",
         "scaler_json": "scaler.json",
@@ -185,7 +215,10 @@ def load_build_specs(model_slug: str) -> tuple[list[str], dict[str, Any]]:
 
 
 def unusable_output_codes(model_slug: str, freq_seconds: int) -> set[str]:
-    report = DATA_ENGINEERING_DIR / "outputs" / "reports" / f"unusable_outputs_{model_slug}_{freq_seconds}s.csv"
+    reports_root = dataset_output_root_for(model_dataset_id(model_slug, freq_seconds, 120, 60)) / "reports"
+    report = reports_root / model_slug / "quality" / f"unusable_outputs_{model_slug}_{freq_seconds}s.csv"
+    if not report.exists():
+        report = reports_root / f"unusable_outputs_{model_slug}_{freq_seconds}s.csv"
     if not report.exists():
         return set()
     rows = read_csv_rows(report)
@@ -224,6 +257,44 @@ def infer_columns(chunk_root: Path, model_slug: str, freq_seconds: int) -> tuple
     if not target_columns:
         raise SystemExit(f"No usable target columns found for {model_slug}.")
     return feature_columns, target_columns
+
+
+def validate_current_splits(chunk_root: Path) -> None:
+    manifest_rows = read_csv_rows(chunk_root / "manifest.csv")
+    split_rows = read_csv_rows(chunk_root / "splits" / "split_manifest.csv")
+    current = {row["chunk_id"]: row for row in manifest_rows}
+    included: set[str] = set()
+    mismatches: list[str] = []
+    for row in split_rows:
+        chunk_id = row["chunk_id"]
+        source = current.get(chunk_id)
+        if source is None:
+            mismatches.append(f"unknown chunk {chunk_id}")
+        elif row.get("param_id") != source.get("param_id") or row.get("windows") != source.get("windows"):
+            mismatches.append(f"outdated chunk {chunk_id}")
+        included.add(chunk_id)
+
+    expected = {row["chunk_id"] for row in manifest_rows if int(float(row.get("windows") or 0)) > 0}
+    missing = expected - included
+    if missing:
+        mismatches.append(f"{len(missing)} current non-empty chunks are missing")
+
+    expected_windows = sum(int(float(row.get("windows") or 0)) for row in manifest_rows)
+    split_windows = sum(int(float(row.get("windows") or 0)) for row in split_rows)
+    if split_windows != expected_windows:
+        mismatches.append(f"window total {split_windows} != current manifest {expected_windows}")
+
+    for split in ("train", "val", "test"):
+        path = chunk_root / "splits" / f"{split}_chunks.csv"
+        if not path.exists() or not read_csv_rows(path):
+            mismatches.append(f"missing or empty {split}_chunks.csv")
+
+    if mismatches:
+        details = "; ".join(mismatches[:5])
+        raise SystemExit(
+            f"Stale or incomplete split files under {chunk_root / 'splits'}: {details}. "
+            "Regenerate splits from the current manifest before preparing training."
+        )
 
 
 def split_rows(chunk_root: Path, split: str) -> list[dict[str, str]]:
@@ -577,13 +648,23 @@ def prepare_bridge(
 ) -> dict[str, Any]:
     chunk_root = chunk_root_for(model_slug, freq_seconds, seq_len, pred_len)
     if not chunk_root.exists():
-        raise SystemExit(f"Missing chunked dataset: {chunk_root}")
+        raise SystemExit(
+            f"Missing chunked dataset: {chunk_root}. Set WISBURN_FORECAST_DATASET_OUTPUT_ROOT "
+            "to the directory containing datasets/chunked, if the dataset is stored elsewhere."
+        )
+    validate_current_splits(chunk_root)
     ready_dir = training_ready_dir_for(model_slug, freq_seconds, seq_len, pred_len)
     scaler_path = ready_dir / "scaler.json"
     metadata_path = ready_dir / "metadata.json"
     yaml_path = ready_dir / "tslib_chunked_config.yaml"
 
     candidate_columns, target_columns = infer_columns(chunk_root, model_slug, freq_seconds)
+    expected_targets = {"model1": 14, "model2": 5}.get(model_slug)
+    if expected_targets is not None and len(target_columns) != expected_targets:
+        raise SystemExit(
+            f"{model_slug} has {len(target_columns)} usable targets; expected {expected_targets}. "
+            "Check the point configuration and unusable-output report before training."
+        )
     feature_columns = list(candidate_columns)
     dropped_near_constant_inputs: list[str] = []
     if scaler_path.exists() and not force_refit_scaler:

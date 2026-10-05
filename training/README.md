@@ -2,7 +2,7 @@
 
 本目录是 `offline/forecast` 的训练实现：包含兴蓉 3# 炉预测模型的数据桥接、训练配置和原始 Crossformer 对照实现。它可随代码仓库维护；原始点位数据、分块训练集、checkpoint、预测数组和部署模型权重均不提交。
 
-当前基线包括模型 1 的十秒原生预测与模型 2 的逐秒预测。不可变输入/输出契约见 [TRAINING_SPEC.md](TRAINING_SPEC.md)，模块总览见 [上级 README](../README.md)。
+当前训练入口提供模型 1、模型 2 两套十秒原生预测配置，均为过去 20 分钟预测未来 10 分钟（`120→60`）。模型 1 动态读取当前 14 个目标，模型 2 动态读取当前 5 个目标；实际特征和目标索引以生成的 `metadata.json` 为准。研究训练参数见脚本顶部 profile，不应把旧 1 秒模型配置或旧目标索引用于本轮训练。
 
 ## 目录职责
 
@@ -19,7 +19,9 @@
 3. 运行本目录训练入口，先保持 `INTERACTIVE_RUN_TRAINING = False` 检查命令和 metadata，再显式启动训练。
 4. 将训练结果按 `TRAINING_SPEC.md` 的交付清单提供给项目方；由项目方完成 bundle 校验和 SHADOW 环境接入。
 
-默认路径适用于完整工程和单独检出的 `offline/forecast`。训练数据、checkpoint 与预测数组可通过 `WISBURN_FORECAST_ARTIFACT_ROOT` 指向受控本地存储；该变量只指定本地文件路径，不涉及 DCS。
+默认路径适用于完整工程和单独检出的 `offline/forecast`。训练数据、checkpoint 与预测数组可通过 `WISBURN_FORECAST_ARTIFACT_ROOT` 指向 VM 的受控本地存储；若代码/数据路径不同，还需设置 `WISBURN_FORECAST_POINT_ROOT`、`WISBURN_FORECAST_CLASSIFICATION_XLSX` 和 `WISBURN_TSLIB_ROOT`。环境变量只指定本地文件路径，不涉及 DCS。
+
+VM 迁移时，除 `offline/forecast/` 源码外，还要准备：点位分类 Excel、Silver 输入（或已生成且与新筛选规则一致的 10 秒分块数据集及 splits）。当前配置的停炉筛选已调整，因此旧数据集不能自动获得本次质量修正；建议在 VM 以新的 artifact 输出目录重建数据集和 splits，再运行训练入口。先保持 `INTERACTIVE_RUN_TRAINING = False` 生成并检查命令；默认单 GPU 0，若 VM 有多卡，再显式设置 `INTERACTIVE_USE_MULTI_GPU=True` 和实际设备列表。
 
 ## 不可替换的事实
 

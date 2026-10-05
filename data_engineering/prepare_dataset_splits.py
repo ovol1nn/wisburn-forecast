@@ -15,7 +15,7 @@ ARTIFACT_ROOT = Path(os.environ.get(
 )) / "data_engineering"
 
 # VSCode interactive defaults.
-INTERACTIVE_MODEL_SLUG = "model1"  # model1 | model2
+INTERACTIVE_MODEL_SLUG = "model2"  # model1 | model2
 INTERACTIVE_FREQ_SECONDS = 10
 INTERACTIVE_SEQ_LEN = 120
 INTERACTIVE_PRED_LEN = 60
@@ -45,6 +45,15 @@ def write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str] | No
 
 def parse_time(value: str) -> datetime:
     return datetime.fromisoformat(value)
+
+
+def resolve_window_path(chunk_root: Path, raw_path: str) -> Path:
+    path = Path(raw_path)
+    if path.exists():
+        return path
+    filename = raw_path.replace("\\", "/").rsplit("/", 1)[-1]
+    copied_path = chunk_root / "windows" / filename
+    return copied_path if copied_path.exists() else path
 
 
 def as_int(value: str | int | float | None) -> int:
@@ -146,7 +155,7 @@ def main() -> int:
             if not row["split"] in {"train", "val", "test"}:
                 continue
             count, row_errors = validate_window_file(
-                Path(row["window_path"]),
+                resolve_window_path(chunk_root, row["window_path"]),
                 INTERACTIVE_SEQ_LEN,
                 INTERACTIVE_PRED_LEN,
                 INTERACTIVE_FREQ_SECONDS,

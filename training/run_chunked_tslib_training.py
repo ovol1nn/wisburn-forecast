@@ -11,17 +11,25 @@ import chunked_tslib_dataset as bridge
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = SCRIPT_DIR.parents[2]
-TSLIB_ROOT = Path(os.environ.get(
-    "WISBURN_TSLIB_ROOT",
+TSLIB_ROOT_OVERRIDE = os.environ.get("WISBURN_TSLIB_ROOT")
+TSLIB_ROOT_CANDIDATES = [
+    SCRIPT_DIR / "Time-Series-Library",
     WORKSPACE_ROOT / "offline" / "forecast" / "tslib",
-))
+]
+if TSLIB_ROOT_OVERRIDE:
+    TSLIB_ROOT = Path(TSLIB_ROOT_OVERRIDE)
+else:
+    TSLIB_ROOT = next(
+        (path for path in TSLIB_ROOT_CANDIDATES if (path / "run.py").exists()),
+        TSLIB_ROOT_CANDIDATES[0],
+    )
 
 # VSCode interactive defaults.
 # 1) Run once with INTERACTIVE_RUN_TRAINING = False to generate/inspect metadata and command.
 # 2) Set INTERACTIVE_RUN_TRAINING = True to launch original TSLib training.
-INTERACTIVE_TRAINING_PROFILE = "model1_10s_trend_8gpu"  # model1_10s_trend_8gpu | model1_8gpu | model2_8gpu
+INTERACTIVE_TRAINING_PROFILE = "model1_10s"  # model1_10s | model2_10s
 VM_TRAINING_PROFILES = {
-    "model1_10s_trend_8gpu": {
+    "model1_10s": {
         "model_slug": "model1",
         "freq_seconds": 10,
         "seq_len": 120,
@@ -29,7 +37,7 @@ VM_TRAINING_PROFILES = {
         "pred_len": 60,
         "epochs": 60,
         "patience": 8,
-        "batch_size": 128,
+        "batch_size": 32,
         "learning_rate": 2e-5,
         "d_model": 192,
         "n_heads": 6,
@@ -41,25 +49,15 @@ VM_TRAINING_PROFILES = {
         "loss_endpoint_weight": 0.5,
         "des": "xingrong3_model1_10s_trend_endpoint_v1",
     },
-    "model1_8gpu": {
-        "model_slug": "model1",
-        "epochs": 8,
-        "patience": 3,
-        "batch_size": 128,
-        "learning_rate": 2e-5,
-        "d_model": 192,
-        "n_heads": 6,
-        "e_layers": 2,
-        "d_layers": 1,
-        "d_ff": 384,
-        "patch_len": 8,
-        "des": "xingrong3_model1_pred600_8gpu_v2_constdrop",
-    },
-    "model2_8gpu": {
+    "model2_10s": {
         "model_slug": "model2",
-        "epochs": 8,
-        "patience": 3,
-        "batch_size": 256,
+        "freq_seconds": 10,
+        "seq_len": 120,
+        "label_len": 60,
+        "pred_len": 60,
+        "epochs": 60,
+        "patience": 8,
+        "batch_size": 64,
         "learning_rate": 3e-5,
         "d_model": 128,
         "n_heads": 4,
@@ -67,17 +65,17 @@ VM_TRAINING_PROFILES = {
         "d_layers": 1,
         "d_ff": 256,
         "patch_len": 16,
-        "des": "xingrong3_model2_pred600_8gpu_v1",
+        "des": "xingrong3_model2_10s_v1",
     },
 }
 PROFILE = VM_TRAINING_PROFILES[INTERACTIVE_TRAINING_PROFILE]
 
 INTERACTIVE_MODEL_SLUG = PROFILE["model_slug"]
-INTERACTIVE_FREQ_SECONDS = PROFILE.get("freq_seconds", 1)
-INTERACTIVE_SEQ_LEN = PROFILE.get("seq_len", 1200)
-INTERACTIVE_LABEL_LEN = PROFILE.get("label_len", 600)
-INTERACTIVE_PRED_LEN = PROFILE.get("pred_len", 600)
-INTERACTIVE_FORCE_REFIT_SCALER = False
+INTERACTIVE_FREQ_SECONDS = PROFILE.get("freq_seconds", 10)
+INTERACTIVE_SEQ_LEN = PROFILE.get("seq_len", 120)
+INTERACTIVE_LABEL_LEN = PROFILE.get("label_len", 60)
+INTERACTIVE_PRED_LEN = PROFILE.get("pred_len", 60)
+INTERACTIVE_FORCE_REFIT_SCALER = True
 INTERACTIVE_RUN_TRAINING = False
 
 # Original model training arguments.
@@ -103,7 +101,7 @@ INTERACTIVE_LOSS_ENDPOINT_WEIGHT = PROFILE.get("loss_endpoint_weight", 0.0)
 INTERACTIVE_USE_GPU = True
 INTERACTIVE_GPU = 0
 INTERACTIVE_USE_MULTI_GPU = True
-INTERACTIVE_DEVICES = "0,1,2,3,4,5,6,7"
+INTERACTIVE_DEVICES = "0,1"
 INTERACTIVE_DES = PROFILE["des"]
 INTERACTIVE_PRINT_EVERY = 100
 INTERACTIVE_RESUME_TRAINING = False
@@ -117,14 +115,9 @@ def rel_path(path: Path) -> str:
         return str(path.resolve())
 
 
-def build_command(metadata: dict) -> list[str]:
+def build_command(metadata: dict, ready_dir: Path) -> list[str]:
     target_indices = ",".join(str(i) for i in metadata["target_indices"])
-    root_path = (
-        Path("..")
-        / "outputs"
-        / "training_ready"
-        / metadata["dataset_id"]
-    )
+    root_path = ready_dir.resolve()
     model_id = f"{metadata['model_slug']}_{INTERACTIVE_TSLIB_MODEL}_s{metadata['seq_len']}_p{metadata['pred_len']}"
     cmd = [
         sys.executable,
@@ -220,6 +213,34 @@ def write_command_file(path: Path, cmd: list[str]) -> None:
     path.write_text(" ".join(f'"{x}"' if " " in x else x for x in cmd) + "\n", encoding="utf-8")
 
 
+def validate_training_runtime() -> None:
+    run_script = TSLIB_ROOT / "run.py"
+    if not run_script.exists():
+        raise SystemExit(
+            f"Time-Series-Library run.py not found: {run_script}. "
+            "Set WISBURN_TSLIB_ROOT to the directory containing run.py."
+        )
+    if not INTERACTIVE_USE_GPU:
+        return
+    if bridge.torch is None or not bridge.torch.cuda.is_available():
+        raise SystemExit("GPU training requested, but PyTorch cannot access CUDA.")
+    if INTERACTIVE_USE_MULTI_GPU:
+        try:
+            device_ids = [int(item.strip()) for item in INTERACTIVE_DEVICES.split(",") if item.strip()]
+        except ValueError as exc:
+            raise SystemExit(f"Invalid INTERACTIVE_DEVICES: {INTERACTIVE_DEVICES}") from exc
+        if len(device_ids) < 2 or len(set(device_ids)) != len(device_ids):
+            raise SystemExit("Multi-GPU mode needs at least two distinct IDs, e.g. '0,1'.")
+        visible_count = bridge.torch.cuda.device_count()
+        if max(device_ids) >= visible_count:
+            raise SystemExit(
+                f"Requested GPUs {INTERACTIVE_DEVICES}, but PyTorch sees only {visible_count}. "
+                "Check nvidia-smi and CUDA_VISIBLE_DEVICES."
+            )
+        if INTERACTIVE_GPU != device_ids[0]:
+            raise SystemExit("INTERACTIVE_GPU must match the first ID in INTERACTIVE_DEVICES.")
+
+
 def main() -> int:
     metadata = bridge.prepare_bridge(
         INTERACTIVE_MODEL_SLUG,
@@ -229,13 +250,13 @@ def main() -> int:
         pred_len=INTERACTIVE_PRED_LEN,
         force_refit_scaler=INTERACTIVE_FORCE_REFIT_SCALER,
     )
-    cmd = build_command(metadata)
     ready_dir = bridge.training_ready_dir_for(
         metadata["model_slug"],
         int(metadata["freq_seconds"]),
         int(metadata["seq_len"]),
         int(metadata["pred_len"]),
     )
+    cmd = build_command(metadata, ready_dir)
     command_path = ready_dir / "last_train_command.txt"
     write_command_file(command_path, cmd)
 
@@ -244,10 +265,21 @@ def main() -> int:
     print(f"target_indices: {metadata['target_indices']}", flush=True)
     print(f"n_vars: {metadata['n_vars']}", flush=True)
     print(f"command file: {rel_path(command_path)}", flush=True)
+    dataset_root = bridge.chunk_root_for(
+        INTERACTIVE_MODEL_SLUG,
+        INTERACTIVE_FREQ_SECONDS,
+        INTERACTIVE_SEQ_LEN,
+        INTERACTIVE_PRED_LEN,
+    )
+    print(f"dataset root: {dataset_root}", flush=True)
+    print(f"TSLib root: {TSLIB_ROOT}", flush=True)
 
     if not INTERACTIVE_RUN_TRAINING:
+        bridge.smoke_test(metadata)
         print("INTERACTIVE_RUN_TRAINING = False; command prepared but not launched.", flush=True)
         return 0
+
+    validate_training_runtime()
 
     env = os.environ.copy()
     if not INTERACTIVE_USE_GPU:

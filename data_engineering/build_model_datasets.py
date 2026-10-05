@@ -459,6 +459,13 @@ def make_output_dirs(cfg: dict[str, Any], freq_seconds: int) -> dict[str, Path]:
     return paths
 
 
+def report_path(paths: dict[str, Path], category: str, filename: str, model_slug: str = "shared") -> Path:
+    """Keep generated reports grouped by model and report purpose."""
+    directory = paths["reports"] / model_slug / category
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / filename
+
+
 def range_suffix(start: Any | None, end: Any | None) -> str:
     if not start and not end:
         return ""
@@ -636,9 +643,9 @@ def build_point_caches(
         quality_rows.append(row)
         save_manifest(manifest_path, manifest)
 
-    report_path = paths["reports"] / f"point_quality_{freq_seconds}s.csv"
-    pd.DataFrame(quality_rows).to_csv(report_path, index=False, encoding="utf-8-sig")
-    print(f"point quality report: {rel_path(report_path)}", flush=True)
+    quality_report = report_path(paths, "quality", f"point_quality_{freq_seconds}s.csv")
+    pd.DataFrame(quality_rows).to_csv(quality_report, index=False, encoding="utf-8-sig")
+    print(f"point quality report: {rel_path(quality_report)}", flush=True)
     return built_codes, quality_rows
 
 
@@ -833,6 +840,57 @@ def robust_clean_series(pd: Any, series: Any, *, min_val: float | None = None, m
     return s
 
 
+def quantile_iqr_clean_series(pd: Any, series: Any, settings: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+    s = series.copy()
+    non_null = s.dropna()
+    audit: dict[str, Any] = {
+        "rows": int(len(s)),
+        "non_null_rows": int(len(non_null)),
+        "q1": math.nan,
+        "q3": math.nan,
+        "iqr": math.nan,
+        "lower_fence": math.nan,
+        "upper_fence": math.nan,
+        "outside_fence_rows": 0,
+        "isolated_outliers_removed": 0,
+        "status": "disabled",
+    }
+    if not settings.get("enabled", True):
+        return s, audit
+    if len(non_null) < int(settings.get("min_non_null_rows", 100)):
+        audit["status"] = "insufficient_samples"
+        return s, audit
+
+    q_low = float(settings.get("lower_quantile", 0.25))
+    q_high = float(settings.get("upper_quantile", 0.75))
+    q1 = float(non_null.quantile(q_low))
+    q3 = float(non_null.quantile(q_high))
+    iqr = q3 - q1
+    audit.update({"q1": q1, "q3": q3, "iqr": iqr})
+    if not math.isfinite(iqr) or iqr <= 0:
+        audit["status"] = "zero_or_invalid_iqr"
+        return s, audit
+
+    multiplier = float(settings.get("iqr_multiplier", 3.0))
+    lower = q1 - multiplier * iqr
+    upper = q3 + multiplier * iqr
+    outside = (s < lower) | (s > upper)
+    inside_previous = s.shift(1).between(lower, upper).fillna(False)
+    inside_next = s.shift(-1).between(lower, upper).fillna(False)
+    isolated = outside.fillna(False) & inside_previous & inside_next
+    audit.update(
+        {
+            "lower_fence": lower,
+            "upper_fence": upper,
+            "outside_fence_rows": int(outside.sum()),
+            "isolated_outliers_removed": int(isolated.sum()),
+            "status": "applied",
+        }
+    )
+    s[isolated] = pd.NA
+    return s, audit
+
+
 def range_for_spec(spec: VariableSpec, cfg: dict[str, Any]) -> tuple[float | None, float | None]:
     text = f"{spec.point_code} {spec.point_name} {spec.target_name}".upper()
     for token, bounds in cfg.get("pollutant_ranges", {}).items():
@@ -843,7 +901,15 @@ def range_for_spec(spec: VariableSpec, cfg: dict[str, Any]) -> tuple[float | Non
     return None, None
 
 
-def clean_model_frame(pd: Any, df: Any, specs: list[VariableSpec], cfg: dict[str, Any], *, model: str | None = None) -> Any:
+def clean_model_frame(
+    pd: Any,
+    df: Any,
+    specs: list[VariableSpec],
+    cfg: dict[str, Any],
+    *,
+    model: str | None = None,
+    quantile_audit: list[dict[str, Any]] | None = None,
+) -> Any:
     out = df.copy()
     active_model = model or (specs[0].model if specs else None)
     by_code = {s.point_code: s for s in specs}
@@ -854,6 +920,14 @@ def clean_model_frame(pd: Any, df: Any, specs: list[VariableSpec], cfg: dict[str
         spec = by_code.get(code)
         if not spec:
             continue
+        if is_output_role(spec.io_type):
+            out[code], audit = quantile_iqr_clean_series(
+                pd,
+                out[code],
+                cfg.get("quantile_outlier_filter", {}),
+            )
+            if quantile_audit is not None:
+                quantile_audit.append({"point_code": code, **audit})
         min_val, max_val = range_for_spec(spec, cfg)
         if min_val is not None or max_val is not None or is_output_role(spec.io_type):
             out[code] = robust_clean_series(pd, out[code], min_val=min_val, max_val=max_val)
@@ -1024,7 +1098,28 @@ def windows_to_mask(pd: Any, timestamps: Any, windows: Any) -> Any:
     return mask
 
 
-def detect_excluded_windows(pd: Any, df: Any, cfg: dict[str, Any], model_point_codes: list[str]) -> Any:
+def persistent_mask(pd: Any, timestamps: Any, mask: Any, *, min_duration_seconds: float, freq_seconds: int) -> Any:
+    if min_duration_seconds <= 0:
+        return mask.fillna(False).astype(bool)
+    windows = boolean_windows(
+        pd,
+        timestamps,
+        mask,
+        "persistent_low_indicator",
+        max_gap_seconds=max(float(freq_seconds) * 1.5, float(freq_seconds)),
+        min_duration_seconds=min_duration_seconds,
+    )
+    return windows_to_mask(pd, timestamps, windows)
+
+
+def detect_excluded_windows(
+    pd: Any,
+    df: Any,
+    cfg: dict[str, Any],
+    model_point_codes: list[str],
+    *,
+    freq_seconds: int,
+) -> Any:
     masks = []
     reasons = []
     existing = [c for c in model_point_codes if c in df.columns]
@@ -1037,9 +1132,18 @@ def detect_excluded_windows(pd: Any, df: Any, cfg: dict[str, Any], model_point_c
         if code in df.columns:
             low_value = df[code] < float(item.get("min_running_value", 0))
             if bool(item.get("missing_is_bad", False)):
-                masks.append(df[code].isna() | low_value)
+                low_value = df[code].isna() | low_value
             else:
-                masks.append(df[code].notna() & low_value)
+                low_value = df[code].notna() & low_value
+            masks.append(
+                persistent_mask(
+                    pd,
+                    df["timestamp"],
+                    low_value,
+                    min_duration_seconds=float(item.get("min_duration_seconds", 0)),
+                    freq_seconds=freq_seconds,
+                )
+            )
             reasons.append(f"shutdown_indicator:{code}")
     windows = [boolean_windows(pd, df["timestamp"], mask, reason) for mask, reason in zip(masks, reasons)]
     if not windows:
@@ -1180,9 +1284,16 @@ def build_training_mask(
         if code in df.columns:
             low_value = df[code] < float(item.get("min_running_value", 0))
             if bool(item.get("missing_is_bad", False)):
-                mask[col] = df[code].isna() | low_value
+                low_value = df[code].isna() | low_value
             else:
-                mask[col] = df[code].notna() & low_value
+                low_value = df[code].notna() & low_value
+            mask[col] = persistent_mask(
+                pd,
+                df["timestamp"],
+                low_value,
+                min_duration_seconds=float(item.get("min_duration_seconds", 0)),
+                freq_seconds=freq_seconds,
+            )
         else:
             mask[col] = False
         shutdown_cols.append(col)
@@ -1459,13 +1570,13 @@ def build_model_dataset_chunked(
     print(f"range: {full_start} -> {full_end}; chunk_days={chunk_days}", flush=True)
     report_range_suffix = chunk_range_suffix
     q = global_quality_from_caches(pd, paths, model_codes, cfg, start=full_start, end=full_end)
-    q_path = paths["reports"] / f"{slug}_quality_{freq_seconds}s{report_range_suffix}.csv"
+    q_path = report_path(paths, "quality", f"{slug}_quality_{freq_seconds}s{report_range_suffix}.csv", slug)
     q.to_csv(q_path, index=False, encoding="utf-8-sig")
     low_info = low_information_inputs(pd, q, model_specs, cfg)
-    low_info_path = paths["reports"] / f"low_information_inputs_{slug}_{freq_seconds}s{report_range_suffix}.csv"
+    low_info_path = report_path(paths, "quality", f"low_information_inputs_{slug}_{freq_seconds}s{report_range_suffix}.csv", slug)
     low_info.to_csv(low_info_path, index=False, encoding="utf-8-sig")
     bad_outputs = unusable_outputs(pd, q, model_specs, cfg)
-    bad_outputs_path = paths["reports"] / f"unusable_outputs_{slug}_{freq_seconds}s{report_range_suffix}.csv"
+    bad_outputs_path = report_path(paths, "quality", f"unusable_outputs_{slug}_{freq_seconds}s{report_range_suffix}.csv", slug)
     bad_outputs.to_csv(bad_outputs_path, index=False, encoding="utf-8-sig")
     stable_drop_cols = low_info["point_code"].tolist() if "point_code" in low_info.columns else []
     stable_bad_outputs = bad_outputs["point_code"].tolist() if "point_code" in bad_outputs.columns else []
@@ -1485,6 +1596,7 @@ def build_model_dataset_chunked(
     common_low_windows_all = []
     excluded_windows_all = []
     invalid_windows_all = []
+    quantile_audit_all = []
     chunks = iter_time_chunks(pd, full_start, full_end, chunk_days)
     for idx, (core_start, core_end) in enumerate(chunks, 1):
         chunk_id = f"part{idx:04d}_{time_label(core_start)}_{time_label(core_end)}"
@@ -1507,6 +1619,8 @@ def build_model_dataset_chunked(
                 "input_interpolate_limit": cfg_value(cfg, "input_interpolate_limit", 6, model),
                 "input_forward_fill_limit": cfg_value(cfg, "input_forward_fill_limit", 30, model),
                 "training_exclusion_buffer_seconds": cfg_value(cfg, "training_exclusion_buffer_seconds", 0, model),
+                "shutdown_indicators": cfg.get("shutdown_indicators", []),
+                "quantile_outlier_filter": cfg.get("quantile_outlier_filter", {}),
                 "write_chunk_wide": write_chunk_wide,
             }
         )
@@ -1535,7 +1649,9 @@ def build_model_dataset_chunked(
             check_size=False,
         )
         wide, derived_notes = add_derived_features(pd, wide, cfg)
-        wide = clean_model_frame(pd, wide, model_specs, cfg, model=model)
+        quantile_audit = []
+        wide = clean_model_frame(pd, wide, model_specs, cfg, model=model, quantile_audit=quantile_audit)
+        quantile_audit_all.extend({"chunk_id": chunk_id, **row} for row in quantile_audit)
         if write_chunk_wide:
             write_dataset(pd, downcast_numeric_frame(wide), wide_path)
 
@@ -1587,7 +1703,7 @@ def build_model_dataset_chunked(
             window_index.insert(1, "frame_path", str(frame_path))
         window_index.to_csv(window_path, index=False, encoding="utf-8-sig")
 
-        windows = detect_excluded_windows(pd, wide, cfg, model_codes)
+        windows = detect_excluded_windows(pd, wide, cfg, model_codes, freq_seconds=freq_seconds)
         buffered_windows = boolean_windows(
             pd,
             training_mask["timestamp"],
@@ -1636,19 +1752,25 @@ def build_model_dataset_chunked(
     pd.DataFrame(manifest_rows).to_csv(manifest_csv, index=False, encoding="utf-8-sig")
     if common_low_windows_all:
         pd.concat(common_low_windows_all, ignore_index=True).to_csv(
-            paths["reports"] / f"common_low_anomaly_windows_{slug}_{freq_seconds}s{report_range_suffix}_chunked.csv",
+            report_path(paths, "screening", f"common_low_anomaly_windows_{slug}_{freq_seconds}s{report_range_suffix}_chunked.csv", slug),
             index=False,
             encoding="utf-8-sig",
         )
     if excluded_windows_all:
         pd.concat(excluded_windows_all, ignore_index=True).to_csv(
-            paths["reports"] / f"excluded_time_windows_{slug}_{freq_seconds}s{report_range_suffix}_chunked.csv",
+            report_path(paths, "screening", f"excluded_time_windows_{slug}_{freq_seconds}s{report_range_suffix}_chunked.csv", slug),
             index=False,
             encoding="utf-8-sig",
         )
     if invalid_windows_all:
         pd.concat(invalid_windows_all, ignore_index=True).to_csv(
-            paths["reports"] / f"invalid_training_windows_{slug}_{freq_seconds}s{report_range_suffix}_chunked.csv",
+            report_path(paths, "screening", f"invalid_training_windows_{slug}_{freq_seconds}s{report_range_suffix}_chunked.csv", slug),
+            index=False,
+            encoding="utf-8-sig",
+        )
+    if quantile_audit_all:
+        pd.DataFrame(quantile_audit_all).to_csv(
+            report_path(paths, "quality", f"quantile_outlier_audit_{slug}_{freq_seconds}s{report_range_suffix}_chunked.csv", slug),
             index=False,
             encoding="utf-8-sig",
         )
@@ -1679,21 +1801,27 @@ def build_model_dataset(
     print(f"build wide table for {model}: {len(model_codes)} model points", flush=True)
     wide = merge_wide_table(pd, paths, unique_in_order(model_codes + sorted(derived_source_codes(cfg))), cfg)
     wide, derived_notes = add_derived_features(pd, wide, cfg)
-    wide = clean_model_frame(pd, wide, model_specs, cfg, model=model)
+    quantile_audit = []
+    wide = clean_model_frame(pd, wide, model_specs, cfg, model=model, quantile_audit=quantile_audit)
 
     model_slug = model.replace("子模型", "model")
     data_path = paths["datasets"] / f"{model_slug}_{freq_seconds}s.parquet"
     write_dataset(pd, wide, data_path)
 
     q = quality_summary(pd, wide, model_codes, cfg)
-    q_path = paths["reports"] / f"{model_slug}_quality_{freq_seconds}s.csv"
+    q_path = report_path(paths, "quality", f"{model_slug}_quality_{freq_seconds}s.csv", model_slug)
     q.to_csv(q_path, index=False, encoding="utf-8-sig")
+    pd.DataFrame(quantile_audit).to_csv(
+        report_path(paths, "quality", f"quantile_outlier_audit_{model_slug}_{freq_seconds}s.csv", model_slug),
+        index=False,
+        encoding="utf-8-sig",
+    )
 
     low_info = low_information_inputs(pd, q, model_specs, cfg)
-    low_info_path = paths["reports"] / f"low_information_inputs_{model_slug}_{freq_seconds}s.csv"
+    low_info_path = report_path(paths, "quality", f"low_information_inputs_{model_slug}_{freq_seconds}s.csv", model_slug)
     low_info.to_csv(low_info_path, index=False, encoding="utf-8-sig")
     bad_outputs = unusable_outputs(pd, q, model_specs, cfg)
-    bad_outputs_path = paths["reports"] / f"unusable_outputs_{model_slug}_{freq_seconds}s.csv"
+    bad_outputs_path = report_path(paths, "quality", f"unusable_outputs_{model_slug}_{freq_seconds}s.csv", model_slug)
     bad_outputs.to_csv(bad_outputs_path, index=False, encoding="utf-8-sig")
     stable_bad_outputs = bad_outputs["point_code"].tolist() if "point_code" in bad_outputs.columns else []
 
@@ -1707,11 +1835,11 @@ def build_model_dataset(
         model_codes,
         freq_seconds=freq_seconds,
     )
-    common_low_score_path = paths["reports"] / f"common_low_score_{model_slug}_{freq_seconds}s.parquet"
+    common_low_score_path = report_path(paths, "screening", f"common_low_score_{model_slug}_{freq_seconds}s.parquet", model_slug)
     write_dataset(pd, common_low_score, common_low_score_path)
-    common_low_windows_path = paths["reports"] / f"common_low_anomaly_windows_{model_slug}_{freq_seconds}s.csv"
+    common_low_windows_path = report_path(paths, "screening", f"common_low_anomaly_windows_{model_slug}_{freq_seconds}s.csv", model_slug)
     common_low_windows.to_csv(common_low_windows_path, index=False, encoding="utf-8-sig")
-    common_low_candidates_path = paths["reports"] / f"common_low_candidates_{model_slug}_{freq_seconds}s.csv"
+    common_low_candidates_path = report_path(paths, "screening", f"common_low_candidates_{model_slug}_{freq_seconds}s.csv", model_slug)
     common_low_candidates.to_csv(common_low_candidates_path, index=False, encoding="utf-8-sig")
 
     training_mask = build_training_mask(
@@ -1739,11 +1867,11 @@ def build_model_dataset(
     training_path = paths["datasets"] / f"{model_slug}_training_frame_{freq_seconds}s.parquet"
     write_dataset(pd, training_frame, training_path)
 
-    mask_path = paths["reports"] / f"training_mask_{model_slug}_{freq_seconds}s.parquet"
+    mask_path = report_path(paths, "screening", f"training_mask_{model_slug}_{freq_seconds}s.parquet", model_slug)
     write_dataset(pd, training_mask, mask_path)
 
-    windows = detect_excluded_windows(pd, wide, cfg, model_codes)
-    w_path = paths["reports"] / f"excluded_time_windows_{model_slug}_{freq_seconds}s.csv"
+    windows = detect_excluded_windows(pd, wide, cfg, model_codes, freq_seconds=freq_seconds)
+    w_path = report_path(paths, "screening", f"excluded_time_windows_{model_slug}_{freq_seconds}s.csv", model_slug)
     windows.to_csv(w_path, index=False, encoding="utf-8-sig")
 
     buffered_windows = boolean_windows(
@@ -1752,7 +1880,7 @@ def build_model_dataset(
         ~training_mask["valid_for_training"],
         "invalid_for_training_after_buffer",
     )
-    bw_path = paths["reports"] / f"invalid_training_windows_{model_slug}_{freq_seconds}s.csv"
+    bw_path = report_path(paths, "screening", f"invalid_training_windows_{model_slug}_{freq_seconds}s.csv", model_slug)
     buffered_windows.to_csv(bw_path, index=False, encoding="utf-8-sig")
 
     window_index = build_window_index(
@@ -1764,15 +1892,15 @@ def build_model_dataset(
         stride=window_stride,
         freq_seconds=freq_seconds,
     )
-    window_path = paths["reports"] / f"window_index_{model_slug}_{freq_seconds}s_seq{seq_len}_pred{pred_len}.csv"
+    window_path = report_path(paths, "diagnostics", f"window_index_{model_slug}_{freq_seconds}s_seq{seq_len}_pred{pred_len}.csv", model_slug)
     window_index.to_csv(window_path, index=False, encoding="utf-8-sig")
 
     valve = valve_response_diagnostics(pd, wide, cfg)
-    v_path = paths["reports"] / f"valve_response_diagnostics_{model_slug}_{freq_seconds}s.csv"
+    v_path = report_path(paths, "diagnostics", f"valve_response_diagnostics_{model_slug}_{freq_seconds}s.csv", model_slug)
     valve.to_csv(v_path, index=False, encoding="utf-8-sig")
 
     if derived_notes:
-        n_path = paths["reports"] / f"derived_feature_notes_{model_slug}_{freq_seconds}s.csv"
+        n_path = report_path(paths, "diagnostics", f"derived_feature_notes_{model_slug}_{freq_seconds}s.csv", model_slug)
         pd.DataFrame(derived_notes).to_csv(n_path, index=False, encoding="utf-8-sig")
 
     valid_rows = int(training_mask["valid_for_training"].sum()) if len(training_mask) else 0
@@ -1811,7 +1939,7 @@ def list_variables(args: argparse.Namespace) -> int:
         print(f"{model}: inputs={inputs}, outputs={outputs}, missing_silver={missing}")
     if args.write:
         paths = make_output_dirs(cfg, int(cfg.get("default_freq_seconds", 60)))
-        out = paths["reports"] / "model_variable_inventory.csv"
+        out = report_path(paths, "quality", "model_variable_inventory.csv")
         fieldnames = list(rows[0].keys()) if rows else []
         with out.open("w", encoding="utf-8-sig", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -1873,7 +2001,7 @@ def inspect_points(args: argparse.Namespace) -> int:
         if args.write:
             paths = make_output_dirs(cfg, int(cfg.get("default_freq_seconds", 60)))
             suffix = args.model or "selected"
-            out = paths["reports"] / f"point_coverage_{suffix}.csv"
+            out = report_path(paths, "quality", f"point_coverage_{suffix}.csv")
             with out.open("w", encoding="utf-8-sig", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
@@ -2006,9 +2134,9 @@ def audit_anomalies(args: argparse.Namespace) -> int:
         freq_seconds=freq_seconds,
     )
     out_prefix = "audit_common_low"
-    score_path = paths["reports"] / f"{out_prefix}_score_{freq_seconds}s.parquet"
-    windows_path = paths["reports"] / f"{out_prefix}_windows_{freq_seconds}s.csv"
-    candidates_path = paths["reports"] / f"{out_prefix}_candidates_{freq_seconds}s.csv"
+    score_path = report_path(paths, "screening", f"{out_prefix}_score_{freq_seconds}s.parquet")
+    windows_path = report_path(paths, "screening", f"{out_prefix}_windows_{freq_seconds}s.csv")
+    candidates_path = report_path(paths, "screening", f"{out_prefix}_candidates_{freq_seconds}s.csv")
     write_dataset(pd, score, score_path)
     windows.to_csv(windows_path, index=False, encoding="utf-8-sig")
     candidates.to_csv(candidates_path, index=False, encoding="utf-8-sig")
