@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 import chunked_tslib_dataset as bridge
@@ -213,6 +215,49 @@ def write_command_file(path: Path, cmd: list[str]) -> None:
     path.write_text(" ".join(f'"{x}"' if " " in x else x for x in cmd) + "\n", encoding="utf-8")
 
 
+def run_logged_training(cmd: list[str], log_path: Path, env: dict[str, str]) -> None:
+    started_at = datetime.now().astimezone()
+    started_clock = time.monotonic()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with log_path.open("w", encoding="utf-8", buffering=1) as log_file:
+        log_file.write(f"started_at: {started_at.isoformat(timespec='seconds')}\n")
+        log_file.write(f"workspace: {WORKSPACE_ROOT}\n")
+        log_file.write(f"dataset_root: {bridge.chunk_root_for(INTERACTIVE_MODEL_SLUG, INTERACTIVE_FREQ_SECONDS, INTERACTIVE_SEQ_LEN, INTERACTIVE_PRED_LEN)}\n")
+        log_file.write(f"tslib_root: {TSLIB_ROOT}\n")
+        log_file.write(f"command: {' '.join(cmd)}\n")
+        log_file.write("\n--- training output ---\n")
+
+        print(f"training log: {log_path}", flush=True)
+        process = subprocess.Popen(
+            cmd,
+            cwd=str(TSLIB_ROOT),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            log_file.write(line)
+
+        return_code = process.wait()
+        elapsed_seconds = time.monotonic() - started_clock
+        finished_at = datetime.now().astimezone()
+        log_file.write("\n--- training summary ---\n")
+        log_file.write(f"finished_at: {finished_at.isoformat(timespec='seconds')}\n")
+        log_file.write(f"elapsed_seconds: {elapsed_seconds:.1f}\n")
+        log_file.write(f"exit_code: {return_code}\n")
+
+    if return_code != 0:
+        raise subprocess.CalledProcessError(return_code, cmd)
+
+
 def validate_training_runtime() -> None:
     run_script = TSLIB_ROOT / "run.py"
     if not run_script.exists():
@@ -296,7 +341,9 @@ def main() -> int:
 
     print("launching Time-Series-Library training...", flush=True)
     print(" ".join(cmd), flush=True)
-    subprocess.run(cmd, cwd=str(TSLIB_ROOT), check=True, env=env)
+    run_started_at = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+    log_path = ready_dir / "training_logs" / f"{INTERACTIVE_MODEL_SLUG}_{run_started_at}.log"
+    run_logged_training(cmd, log_path, env)
     return 0
 
 
