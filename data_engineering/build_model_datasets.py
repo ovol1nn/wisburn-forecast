@@ -821,6 +821,28 @@ def add_derived_features(pd: Any, df: Any, cfg: dict[str, Any]) -> tuple[Any, li
     return out, notes
 
 
+def derived_feature_names(cfg: dict[str, Any]) -> list[str]:
+    derived = cfg.get("derived_features", {})
+    names = [clean_text(item.get("name")) for item in derived.get("primary_air_sections", [])]
+    names = [name for name in names if name]
+    if names:
+        section_count = len(names)
+        names.extend(["primary_air_total_calc"])
+        names.extend(f"primary_air_section_{idx}_ratio" for idx in range(1, section_count + 1))
+        if derived.get("secondary_air_flow"):
+            names.append("primary_air_ratio_primary_secondary")
+        if derived.get("recirculation_air_flow"):
+            names.extend(["recirculation_air_ratio_total", "recirculation_air_ratio_secondary"])
+    if derived.get("pusher_position_sources"):
+        names.append("pusher_position_mean")
+    names.extend(
+        clean_text(item.get("name"))
+        for item in derived.get("grate_speed_groups", [])
+        if clean_text(item.get("name"))
+    )
+    return unique_in_order(names)
+
+
 def robust_clean_series(pd: Any, series: Any, *, min_val: float | None = None, max_val: float | None = None) -> Any:
     s = series.copy()
     if min_val is not None:
@@ -891,6 +913,89 @@ def quantile_iqr_clean_series(pd: Any, series: Any, settings: dict[str, Any]) ->
     return s, audit
 
 
+def isolated_input_spike_clean_series(pd: Any, series: Any, settings: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+    """Mask one-sample spikes that diverge from a robust local baseline."""
+    s = series.copy()
+    audit: dict[str, Any] = {
+        "rows": int(len(s)),
+        "non_null_rows": int(s.notna().sum()),
+        "iqr": math.nan,
+        "lower_fence": math.nan,
+        "upper_fence": math.nan,
+        "isolated_spikes_masked": 0,
+        "strategy": "disabled",
+        "status": "disabled",
+    }
+    if not settings.get("enabled", True):
+        return s, audit
+
+    window = max(3, int(settings.get("window_points", 15)))
+    if window % 2 == 0:
+        window += 1
+    min_periods = min(window, max(3, int(settings.get("min_periods", 5))))
+    median = s.rolling(window=window, center=True, min_periods=min_periods).median()
+    local_mad = (s - median).abs().rolling(window=window, center=True, min_periods=min_periods).median()
+    local_sigma = local_mad * 1.4826
+    absolute_floor = max(0.0, float(settings.get("absolute_floor", 1e-6)))
+    spike_sigma = float(settings.get("spike_sigma", 8.0))
+    neighbor_sigma = float(settings.get("neighbor_sigma", 3.0))
+    nonzero_steps = s.diff().abs()
+    nonzero_steps = nonzero_steps[nonzero_steps > 0]
+    min_step_count = max(1, int(settings.get("min_step_count", 20)))
+    typical_step = float(nonzero_steps.median()) if len(nonzero_steps) >= min_step_count else 0.0
+    spike_floor = max(absolute_floor, typical_step * float(settings.get("minimum_step_multiple", 4.0)))
+    neighbor_floor = max(absolute_floor, typical_step * float(settings.get("neighbor_step_multiple", 2.0)))
+    previous = s.shift(1)
+    following = s.shift(-1)
+    neighbor_tolerance = neighbor_sigma * local_sigma + neighbor_floor
+    neighbor_confirms_isolated = (
+        ((previous - median).abs() <= neighbor_tolerance)
+        | ((following - median).abs() <= neighbor_tolerance)
+    )
+    spike = (
+        s.notna()
+        & previous.notna()
+        & following.notna()
+        & median.notna()
+        & ((s - median).abs() > (spike_sigma * local_sigma + spike_floor))
+        & neighbor_confirms_isolated
+    )
+    non_null = s.dropna()
+    q1 = float(non_null.quantile(float(settings.get("lower_quantile", 0.25)))) if not non_null.empty else math.nan
+    q3 = float(non_null.quantile(float(settings.get("upper_quantile", 0.75)))) if not non_null.empty else math.nan
+    iqr = q3 - q1
+    if math.isfinite(iqr) and iqr > 0:
+        multiplier = float(settings.get("iqr_multiplier", 3.0))
+        lower_fence = q1 - multiplier * iqr
+        upper_fence = q3 + multiplier * iqr
+        spike &= (s < lower_fence) | (s > upper_fence)
+        strategy = "iqr_fence_and_local_isolation"
+    else:
+        lower_fence = math.nan
+        upper_fence = math.nan
+        strategy = "local_fallback_zero_iqr"
+    spike = spike.fillna(False)
+    audit.update(
+        {
+            "window_points": window,
+            "spike_sigma": spike_sigma,
+            "q1": q1,
+            "q3": q3,
+            "iqr": iqr,
+            "lower_fence": lower_fence,
+            "upper_fence": upper_fence,
+            "typical_step": typical_step,
+            "nonzero_step_count": int(len(nonzero_steps)),
+            "spike_floor": spike_floor,
+            "isolated_spikes_masked": int(spike.sum()),
+            "strategy": strategy,
+            "status": "applied",
+        }
+    )
+    s[spike] = pd.NA
+    return s, audit
+
+
 def range_for_spec(spec: VariableSpec, cfg: dict[str, Any]) -> tuple[float | None, float | None]:
     text = f"{spec.point_code} {spec.point_name} {spec.target_name}".upper()
     for token, bounds in cfg.get("pollutant_ranges", {}).items():
@@ -909,12 +1014,18 @@ def clean_model_frame(
     *,
     model: str | None = None,
     quantile_audit: list[dict[str, Any]] | None = None,
+    input_spike_audit: list[dict[str, Any]] | None = None,
 ) -> Any:
     out = df.copy()
     active_model = model or (specs[0].model if specs else None)
     by_code = {s.point_code: s for s in specs}
     targets = [s.point_code for s in specs if is_output_role(s.io_type) and s.point_code in out.columns]
     inputs = [s.point_code for s in specs if is_input_role(s.io_type) and s.point_code in out.columns]
+    input_features = unique_in_order(
+        inputs
+        + [code for code in derived_source_codes(cfg) if code in out.columns and code not in targets]
+        + [name for name in derived_feature_names(cfg) if name in out.columns]
+    )
 
     for code in targets + inputs:
         spec = by_code.get(code)
@@ -932,19 +1043,28 @@ def clean_model_frame(
         if min_val is not None or max_val is not None or is_output_role(spec.io_type):
             out[code] = robust_clean_series(pd, out[code], min_val=min_val, max_val=max_val)
 
+    for code in input_features:
+        out[code], audit = isolated_input_spike_clean_series(
+            pd,
+            out[code],
+            cfg.get("input_spike_filter", {}),
+        )
+        if input_spike_audit is not None:
+            input_spike_audit.append({"point_code": code, **audit})
+
     # Targets must remain causal: trailing smoothing and limited ffill only.
     for code in targets:
         out[code] = out[code].rolling(window=3, center=False, min_periods=1).mean()
         out[code] = out[code].ffill(limit=int(cfg_value(cfg, "target_forward_fill_limit", 5, active_model)))
 
     # Inputs can use short interpolation because they are known covariates/states.
-    if inputs:
-        out[inputs] = out[inputs].interpolate(
+    if input_features:
+        out[input_features] = out[input_features].interpolate(
             method="linear",
             limit=int(cfg_value(cfg, "input_interpolate_limit", 6, active_model)),
             limit_direction="both",
         )
-        out[inputs] = out[inputs].ffill(limit=int(cfg_value(cfg, "input_forward_fill_limit", 30, active_model)))
+        out[input_features] = out[input_features].ffill(limit=int(cfg_value(cfg, "input_forward_fill_limit", 30, active_model)))
     return out
 
 
@@ -1597,6 +1717,7 @@ def build_model_dataset_chunked(
     excluded_windows_all = []
     invalid_windows_all = []
     quantile_audit_all = []
+    input_spike_audit_all = []
     chunks = iter_time_chunks(pd, full_start, full_end, chunk_days)
     for idx, (core_start, core_end) in enumerate(chunks, 1):
         chunk_id = f"part{idx:04d}_{time_label(core_start)}_{time_label(core_end)}"
@@ -1618,6 +1739,7 @@ def build_model_dataset_chunked(
                 "target_forward_fill_limit": cfg_value(cfg, "target_forward_fill_limit", 5, model),
                 "input_interpolate_limit": cfg_value(cfg, "input_interpolate_limit", 6, model),
                 "input_forward_fill_limit": cfg_value(cfg, "input_forward_fill_limit", 30, model),
+                "input_spike_filter": cfg.get("input_spike_filter", {}),
                 "training_exclusion_buffer_seconds": cfg_value(cfg, "training_exclusion_buffer_seconds", 0, model),
                 "shutdown_indicators": cfg.get("shutdown_indicators", []),
                 "quantile_outlier_filter": cfg.get("quantile_outlier_filter", {}),
@@ -1650,8 +1772,18 @@ def build_model_dataset_chunked(
         )
         wide, derived_notes = add_derived_features(pd, wide, cfg)
         quantile_audit = []
-        wide = clean_model_frame(pd, wide, model_specs, cfg, model=model, quantile_audit=quantile_audit)
+        input_spike_audit = []
+        wide = clean_model_frame(
+            pd,
+            wide,
+            model_specs,
+            cfg,
+            model=model,
+            quantile_audit=quantile_audit,
+            input_spike_audit=input_spike_audit,
+        )
         quantile_audit_all.extend({"chunk_id": chunk_id, **row} for row in quantile_audit)
+        input_spike_audit_all.extend({"chunk_id": chunk_id, **row} for row in input_spike_audit)
         if write_chunk_wide:
             write_dataset(pd, downcast_numeric_frame(wide), wide_path)
 
@@ -1774,6 +1906,12 @@ def build_model_dataset_chunked(
             index=False,
             encoding="utf-8-sig",
         )
+    if input_spike_audit_all:
+        pd.DataFrame(input_spike_audit_all).to_csv(
+            report_path(paths, "quality", f"input_spike_audit_{slug}_{freq_seconds}s{report_range_suffix}_chunked.csv", slug),
+            index=False,
+            encoding="utf-8-sig",
+        )
     print(f"chunked manifest: {rel_path(manifest_csv)}", flush=True)
 
 
@@ -1802,7 +1940,16 @@ def build_model_dataset(
     wide = merge_wide_table(pd, paths, unique_in_order(model_codes + sorted(derived_source_codes(cfg))), cfg)
     wide, derived_notes = add_derived_features(pd, wide, cfg)
     quantile_audit = []
-    wide = clean_model_frame(pd, wide, model_specs, cfg, model=model, quantile_audit=quantile_audit)
+    input_spike_audit = []
+    wide = clean_model_frame(
+        pd,
+        wide,
+        model_specs,
+        cfg,
+        model=model,
+        quantile_audit=quantile_audit,
+        input_spike_audit=input_spike_audit,
+    )
 
     model_slug = model.replace("子模型", "model")
     data_path = paths["datasets"] / f"{model_slug}_{freq_seconds}s.parquet"
@@ -1813,6 +1960,11 @@ def build_model_dataset(
     q.to_csv(q_path, index=False, encoding="utf-8-sig")
     pd.DataFrame(quantile_audit).to_csv(
         report_path(paths, "quality", f"quantile_outlier_audit_{model_slug}_{freq_seconds}s.csv", model_slug),
+        index=False,
+        encoding="utf-8-sig",
+    )
+    pd.DataFrame(input_spike_audit).to_csv(
+        report_path(paths, "quality", f"input_spike_audit_{model_slug}_{freq_seconds}s.csv", model_slug),
         index=False,
         encoding="utf-8-sig",
     )
@@ -2007,6 +2159,90 @@ def inspect_points(args: argparse.Namespace) -> int:
                 writer.writeheader()
                 writer.writerows(rows)
             print(f"coverage: {rel_path(out)}")
+    return 0
+
+
+def clean_existing_chunked_input_spikes(args: argparse.Namespace) -> int:
+    cfg = load_config(args.config)
+    _, pd, _, _ = require_modules()
+    specs = load_variable_specs(cfg)
+    model = args.model
+    slug = model_slug(model)
+    freq_seconds = int(args.freq_seconds)
+    seq_len = int(args.seq_len)
+    pred_len = int(args.pred_len)
+    paths = make_output_dirs(cfg, freq_seconds)
+    chunk_root = paths["datasets"] / "chunked" / f"{slug}_{freq_seconds}s_seq{seq_len}_pred{pred_len}"
+    manifest_path = chunk_root / "manifest.csv"
+    if not manifest_path.exists():
+        raise SystemExit(f"chunked manifest does not exist: {manifest_path}")
+
+    model_specs = [s for s in specs if s.model == model and is_input_role(s.io_type)]
+    output_codes = {s.point_code for s in specs if s.model == model and is_output_role(s.io_type)}
+    input_codes = unique_in_order(
+        [s.point_code for s in model_specs]
+        + [code for code in derived_source_codes(cfg) if code not in output_codes]
+        + derived_feature_names(cfg)
+    )
+    with manifest_path.open("r", encoding="utf-8-sig", newline="") as f:
+        manifest_rows = list(csv.DictReader(f))
+    if not manifest_rows:
+        raise SystemExit(f"chunked manifest is empty: {manifest_path}")
+
+    audit_rows: list[dict[str, Any]] = []
+    total_spikes = 0
+    for idx, row in enumerate(manifest_rows, 1):
+        chunk_id = row["chunk_id"]
+        frame_path = chunk_root / "frames" / f"{chunk_id}.parquet"
+        window_path = chunk_root / "windows" / f"{chunk_id}_windows.csv"
+        if not frame_path.exists() or not window_path.exists():
+            raise SystemExit(f"missing chunk frame/window for {chunk_id}")
+
+        frame = pd.read_parquet(frame_path)
+        valid_before = int(frame["valid_for_training"].fillna(False).astype(bool).sum())
+        for code in input_codes:
+            if code not in frame.columns:
+                continue
+            cleaned, audit = isolated_input_spike_clean_series(
+                pd,
+                frame[code],
+                cfg.get("input_spike_filter", {}),
+            )
+            masked_count = int(audit["isolated_spikes_masked"])
+            total_spikes += masked_count
+            frame[code] = cleaned.interpolate(
+                method="linear",
+                limit=int(cfg_value(cfg, "input_interpolate_limit", 6, model)),
+                limit_direction="both",
+            ).ffill(limit=int(cfg_value(cfg, "input_forward_fill_limit", 30, model)))
+            audit_rows.append({"chunk_id": chunk_id, "point_code": code, **audit})
+
+        valid_after = int(frame["valid_for_training"].fillna(False).astype(bool).sum())
+        if valid_after != valid_before or valid_after != int(row["valid_rows"]):
+            raise SystemExit(
+                f"valid row count changed for {chunk_id}: manifest={row['valid_rows']} "
+                f"before={valid_before} after={valid_after}; refusing to write this frame"
+            )
+        windows = pd.read_csv(window_path, encoding="utf-8-sig")
+        if len(windows) != int(row["windows"]):
+            raise SystemExit(
+                f"window count mismatch for {chunk_id}: manifest={row['windows']} file={len(windows)}"
+            )
+        write_dataset(pd, frame, frame_path)
+        if idx % 25 == 0 or idx == len(manifest_rows):
+            print(f"cleaned input spikes: {idx}/{len(manifest_rows)} chunks", flush=True)
+
+    audit_path = report_path(
+        paths,
+        "quality",
+        f"input_spike_audit_{slug}_{freq_seconds}s_seq{seq_len}_pred{pred_len}_existing_chunks.csv",
+        slug,
+    )
+    pd.DataFrame(audit_rows).to_csv(audit_path, index=False, encoding="utf-8-sig")
+    print(f"chunked dataset: {rel_path(chunk_root)}", flush=True)
+    print(f"input points screened: {len(input_codes)}; masked samples before interpolation: {total_spikes}", flush=True)
+    print(f"input spike audit: {rel_path(audit_path)}", flush=True)
+    print("valid row counts and window counts matched the existing manifest for every chunk", flush=True)
     return 0
 
 
@@ -2229,6 +2465,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_audit.add_argument("--start", default=None, help="Inclusive start timestamp.")
     p_audit.add_argument("--end", default=None, help="Exclusive end timestamp.")
     p_audit.set_defaults(func=audit_anomalies)
+
+    p_clean = sub.add_parser(
+        "clean-chunked-input-spikes",
+        help="Apply input-only isolated-spike screening to an existing chunked dataset.",
+    )
+    p_clean.add_argument("--model", default="子模型1", help="Model name, e.g. 子模型1/子模型2.")
+    p_clean.add_argument("--freq-seconds", type=int, default=10)
+    p_clean.add_argument("--seq-len", type=int, default=120)
+    p_clean.add_argument("--pred-len", type=int, default=60)
+    p_clean.set_defaults(func=clean_existing_chunked_input_spikes)
 
     p_build = sub.add_parser("build", help="Build point caches and model datasets.")
     p_build.add_argument("--model", default="子模型2", help="Model name, e.g. 子模型1/子模型2/子模型3.")

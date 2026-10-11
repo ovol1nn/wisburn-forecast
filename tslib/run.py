@@ -136,6 +136,8 @@ if __name__ == '__main__':
         default=0.0,
         help='Additional MSE weight for the final forecast step.',
     )
+    parser.add_argument('--fail_on_nonfinite', action='store_true', default=False,
+                        help='stop immediately when inputs, model outputs, or loss contain NaN/Inf')
     # Crossformer: whether to add decoder mask embedding for placeholders.
     # Default: enabled. Use --no_dec_mask_embedding to disable.
     parser.add_argument(

@@ -17,6 +17,20 @@
     "iqr_multiplier": 3.0,
     "min_non_null_rows": 100
   },
+  "input_spike_filter": {
+    "enabled": true,
+    "lower_quantile": 0.25,
+    "upper_quantile": 0.75,
+    "iqr_multiplier": 3.0,
+    "window_points": 15,
+    "min_periods": 5,
+    "spike_sigma": 8.0,
+    "neighbor_sigma": 3.0,
+    "min_step_count": 20,
+    "minimum_step_multiple": 4.0,
+    "neighbor_step_multiple": 2.0,
+    "absolute_floor": 1e-6
+  },
   "max_target_missing_rate_drop": 0.98,
   "max_target_constant_ratio_drop": 0.98,
   "min_target_non_null_rows": 1,

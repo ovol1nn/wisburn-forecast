@@ -56,6 +56,59 @@ class QuantileOutlierFilterTests(unittest.TestCase):
         self.assertTrue(cleaned.equals(values))
         self.assertEqual(audit["status"], "insufficient_samples")
 
+    def test_masks_single_spike_on_zero_iqr_input(self) -> None:
+        values = pd.Series([0.0] * 50 + [2.0] + [0.0] * 50)
+        settings = {
+            "enabled": True,
+            "window_points": 15,
+            "min_periods": 5,
+            "spike_sigma": 8.0,
+            "neighbor_sigma": 3.0,
+            "absolute_floor": 1e-6,
+        }
+
+        cleaned, audit = data_quality.isolated_input_spike_clean_series(pd, values, settings)
+
+        self.assertTrue(pd.isna(cleaned.iloc[50]))
+        self.assertEqual(audit["isolated_spikes_masked"], 1)
+        self.assertEqual(audit["status"], "applied")
+
+    def test_keeps_sustained_level_change(self) -> None:
+        values = pd.Series([0.0] * 50 + [2.0] * 20 + [0.0] * 50)
+        settings = {
+            "enabled": True,
+            "window_points": 15,
+            "min_periods": 5,
+            "spike_sigma": 8.0,
+            "neighbor_sigma": 3.0,
+            "absolute_floor": 1e-6,
+        }
+
+        cleaned, audit = data_quality.isolated_input_spike_clean_series(pd, values, settings)
+
+        self.assertTrue(cleaned.iloc[50:70].notna().all())
+        self.assertEqual(audit["isolated_spikes_masked"], 0)
+
+    def test_ignores_quantized_steps_but_masks_large_spike(self) -> None:
+        levels = [0.000635, 0.000684, 0.000733, 0.000782]
+        values = pd.Series((levels * 25) + [0.036] + (levels * 25))
+        settings = {
+            "enabled": True,
+            "window_points": 15,
+            "min_periods": 5,
+            "spike_sigma": 8.0,
+            "neighbor_sigma": 3.0,
+            "min_step_count": 20,
+            "minimum_step_multiple": 4.0,
+            "neighbor_step_multiple": 2.0,
+            "absolute_floor": 1e-6,
+        }
+
+        cleaned, audit = data_quality.isolated_input_spike_clean_series(pd, values, settings)
+
+        self.assertTrue(pd.isna(cleaned.iloc[100]))
+        self.assertEqual(audit["isolated_spikes_masked"], 1)
+
     def test_training_bridge_reads_artifacts_dataset_root(self) -> None:
         import chunked_tslib_dataset as bridge
 

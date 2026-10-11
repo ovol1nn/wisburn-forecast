@@ -20,6 +20,32 @@ class Exp_Long_Term_Forecast(Exp_Basic):
     def __init__(self, args):
         super(Exp_Long_Term_Forecast, self).__init__(args)
 
+    def _check_finite_group(self, named_tensors, context):
+        if not getattr(self.args, 'fail_on_nonfinite', False):
+            return
+        finite_flags = torch.stack([
+            torch.isfinite(tensor.detach()).all() for _, tensor in named_tensors
+        ])
+        if bool(finite_flags.all().item()):
+            return
+
+        for name, tensor in named_tensors:
+            finite_mask = torch.isfinite(tensor.detach())
+            if not bool(finite_mask.all().item()):
+                finite_values = tensor.detach()[finite_mask]
+                if finite_values.numel():
+                    finite_range = 'finite_range=[{:.6g}, {:.6g}]'.format(
+                        finite_values.min().item(), finite_values.max().item()
+                    )
+                else:
+                    finite_range = 'finite_range=empty'
+                bad_count = int((~finite_mask).sum().item())
+                raise FloatingPointError(
+                    'Non-finite {} at {}: shape={}, dtype={}, bad_values={}, {}'.format(
+                        name, context, tuple(tensor.shape), tensor.dtype, bad_count, finite_range
+                    )
+                )
+
     def _maybe_extend_itransformer_encoder_input(self, batch_x, batch_x_mark, batch_y, batch_y_mark):
         """
         For iTransformer only:
@@ -239,7 +265,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         return base_loss + trend_weight * trend_loss + endpoint_weight * endpoint_loss
  
 
-    def vali(self, vali_data, vali_loader, criterion):
+    def vali(self, vali_data, vali_loader, criterion, stage='validation'):
         total_loss = []
         self.model.eval()
         with torch.no_grad():
@@ -249,6 +275,12 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
+                context = '{} batch {}'.format(stage, i + 1)
+                self._check_finite_group(
+                    [('batch_x', batch_x), ('batch_y', batch_y),
+                     ('batch_x_mark', batch_x_mark), ('batch_y_mark', batch_y_mark)],
+                    context,
+                )
 
                 # iTransformer: extend encoder input to seq_len + pred_len as requested
                 batch_x, batch_x_mark, enc_mask = self._maybe_extend_itransformer_encoder_input(
@@ -298,11 +330,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-
                 pred = outputs.detach()
                 true = batch_y.detach()
 
                 loss = self._compute_loss_with_optional_time_weight(pred, true, criterion)
+                self._check_finite_group([('model_output', outputs), ('loss', loss)], context)
 
                 total_loss.append(loss.item())
         total_loss = np.average(total_loss)
@@ -437,6 +469,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 batch_y = batch_y.float().to(self.device)
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
+                context = 'epoch {} train batch {}/{}'.format(epoch + 1, i + 1, train_steps)
 
                 # iTransformer: extend encoder input to seq_len + pred_len as requested
                 batch_x, batch_x_mark, enc_mask = self._maybe_extend_itransformer_encoder_input(
@@ -457,6 +490,12 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 else:
                     dec_inp = self._build_decoder_input(batch_y)
                 dec_inp = dec_inp.to(self.device)
+                self._check_finite_group(
+                    [('batch_x', batch_x), ('batch_y', batch_y),
+                     ('batch_x_mark', batch_x_mark), ('batch_y_mark', batch_y_mark),
+                     ('decoder_input', dec_inp)],
+                    context,
+                )
 
                 # encoder - decoder
                 if self.args.use_amp:
@@ -479,7 +518,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                         loss = self._compute_loss_with_optional_time_weight(
                             outputs, batch_y, criterion, batch_idx=batch_idx, train_series_len=train_series_len
                         )
-                        train_loss.append(loss.item())
+                        self._check_finite_group([('model_output', outputs), ('loss', loss)], context)
                 else:
                     if x_enc_ex is not None:
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark,
@@ -499,7 +538,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     loss = self._compute_loss_with_optional_time_weight(
                         outputs, batch_y, criterion, batch_idx=batch_idx, train_series_len=train_series_len
                     )
-                    train_loss.append(loss.item())
+                    self._check_finite_group([('model_output', outputs), ('loss', loss)], context)
+
+                train_loss.append(loss.item())
 
                 if print_every > 0 and ((i + 1) % print_every == 0 or i == 0 or (i + 1) == train_steps):
                     progress = 100.0 * (i + 1) / max(train_steps, 1)
@@ -527,8 +568,8 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
-            vali_loss = self.vali(vali_data, vali_loader, criterion)
-            test_loss = self.vali(test_data, test_loader, criterion)
+            vali_loss = self.vali(vali_data, vali_loader, criterion, stage='epoch {} validation'.format(epoch + 1))
+            test_loss = self.vali(test_data, test_loader, criterion, stage='epoch {} test'.format(epoch + 1))
 
             print("Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
                 epoch + 1, train_steps, train_loss, vali_loss, test_loss))

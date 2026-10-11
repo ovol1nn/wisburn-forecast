@@ -89,6 +89,7 @@ INTERACTIVE_BATCH_SIZE = PROFILE["batch_size"]
 INTERACTIVE_LEARNING_RATE = PROFILE["learning_rate"]
 INTERACTIVE_NUM_WORKERS = 0
 INTERACTIVE_USE_AMP = True
+INTERACTIVE_FAIL_ON_NONFINITE = True
 INTERACTIVE_CHUNK_MAX_TRAIN_WINDOWS = 0  # 0 means full train split
 INTERACTIVE_CHUNK_MAX_EVAL_WINDOWS = 0  # 0 means full val/test split
 INTERACTIVE_D_MODEL = PROFILE["d_model"]
@@ -206,6 +207,8 @@ def build_command(metadata: dict, ready_dir: Path) -> list[str]:
             cmd.extend(["--resume_checkpoint", INTERACTIVE_RESUME_CHECKPOINT])
     if INTERACTIVE_USE_AMP:
         cmd.append("--use_amp")
+    if INTERACTIVE_FAIL_ON_NONFINITE:
+        cmd.append("--fail_on_nonfinite")
     if INTERACTIVE_USE_MULTI_GPU:
         cmd.extend(["--use_multi_gpu", "--devices", INTERACTIVE_DEVICES])
     return cmd
