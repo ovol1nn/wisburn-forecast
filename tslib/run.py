@@ -108,6 +108,11 @@ if __name__ == '__main__':
              'Empty means compute loss on all variables. Example: "0,2,5".',
     )
     parser.add_argument(
+        '--no_future_covariates',
+        action='store_true',
+        help='Do not use future real-valued covariates in the Crossformer decoder; persist last observed inputs instead.',
+    )
+    parser.add_argument(
         '--loss_time_weighted',
         action='store_true',
         help='Enable time-distance weighted loss (closer to train end => higher weight).',

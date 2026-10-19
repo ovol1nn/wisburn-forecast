@@ -7,4 +7,4 @@
 
 若单独交接 `offline/forecast`，将上述两项通过受控存储提供，并通过环境变量 `WISBURN_FORECAST_POINT_ROOT`、`WISBURN_FORECAST_CLASSIFICATION_XLSX` 配置输入。数据到位后依次执行数据构造、时间切分和训练；大文件产物写入 `offline/artifacts/forecast/` 或 `WISBURN_FORECAST_ARTIFACT_ROOT` 指定的位置。
 
-当前发布模型仍只包含原有两组各五个预测目标。兴蓉 Profile 中新增的压力、温度、负压、三路水位和一次风温度需先检查历史覆盖和点位质量，再重建数据集、训练和验收；仅同步 Silver 文件不会让现有 bundle 自动具备这些输出。
+当前发布模型仍各含5个旧预测目标。新训练数据集已按统一10秒口径构建：模型1含14个物理输出点，模型2仍输出5个排放指标；下一步是训练、逐目标验收并生成新 bundle。仅同步 Silver 文件不会让现有发布 bundle 自动具备新增输出，训练输入必须与本轮 metadata、点位表版本和时间切分一致。

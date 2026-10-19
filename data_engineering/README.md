@@ -1,8 +1,10 @@
 # 模型数据工程
 
-本目录把平台数据存储工具生成的 Silver 点位 Parquet 处理成预测模型数据集。当前两套模型均使用 10 秒粒度、`120→60`；模型 1 为 14 个输出目标，模型 2 为 5 个烟气指标目标。目标列和特征数以点位分类表及训练生成的 metadata 为准。
+本目录把平台数据存储工具生成的 Silver 点位 Parquet 处理成预测模型数据集。当前新训练数据集统一使用 10 秒粒度、`120→60`；模型 1 为14个物理输出目标，模型 2 为5个排放输出目标。该口径只描述新建数据集，不代表当前发布模型 bundle 已更新。目标列和特征数以点位分类表及对应训练生成的 `metadata.json` 为准。
 
-当前目标配置已经包含模型 1 的压力、温度、炉膛负压、汽包水位等 14 个预测目标；模型 2 使用 5 个烟气相关目标。重训时应以点位主表、Silver 覆盖和新生成的 metadata 为准，不要沿用旧版目标索引。默认输入见 `assets/data/xingrong_3/silver/by_point/point_code=<点位>/data.parquet` 与 `assets/profiles/xingrong_3/points/point_classification.xlsx`；单独运行模块时可用 `WISBURN_FORECAST_POINT_ROOT` 和 `WISBURN_FORECAST_CLASSIFICATION_XLSX` 覆盖。
+模型 1 的14个物理输出点由原5点和新增9点组成：主蒸汽压力 A/B、主蒸汽温度、炉膛负压 A/B、汽包水位1/2/3、一次风预热器出口温度。压力和负压的 A/B 点分别作为模型输出，控制层再计算均值。模型 2 的5个输出仍为 CO、HCl、NOx、SO₂、烟尘；点位表中标记为模型2输入的工况点仍按输入角色使用。重训时以点位主表和生成的 metadata 为准，不要沿用旧版目标索引。默认输入见 `assets/data/xingrong_3/silver/by_point/point_code=<点位>/data.parquet` 与 `assets/profiles/xingrong_3/points/point_classification.xlsx`；单独运行模块时可用 `WISBURN_FORECAST_POINT_ROOT` 和 `WISBURN_FORECAST_CLASSIFICATION_XLSX` 覆盖。
+
+数据工程已生成当前的分块数据集目录 `model1_10s_seq120_pred60` 和 `model2_10s_seq120_pred60`。模型1最近一次 14 目标数据构建的点位质量、可用样本、停炉/异常剔除等信息应以同批次报告和 manifest 为准；“quality=ok”表示该点位通过当前结构/覆盖检查，不表示所有值都无异常，也不表示异常都已从训练样本中剔除。模型2新数据集亦尚未对应新训练 bundle。
 
 ## VSCode 直接运行
 

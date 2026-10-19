@@ -131,11 +131,12 @@ class Exp_Long_Term_Forecast(Exp_Basic):
 
         return x_enc_ex, x_mark_ex
 
-    def _build_crossformer_decoder_input_and_mask(self, batch_y):
+    def _build_crossformer_decoder_input_and_mask(self, batch_y, batch_x=None):
         """
         Crossformer decoder 输入构造（自定义）：
         - 输入长度：label_len + pred_len
-        - 外生变量（non-target）：未来 pred_len 段使用真实值
+        - 默认外生变量（non-target）：未来 pred_len 段使用真实值
+        - no_future_covariates 模式：未来所有变量从历史最后观测值延续，不读取未来真实工况
         - 内生变量（target=loss_target_indices）：未来 pred_len 段用 label_len 段均值作为占位符
 
         Returns:
@@ -151,6 +152,13 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             return dec_inp, dec_mask
 
         dec_inp = batch_y[:, : label_len + pred_len, :].clone().float()
+        no_future_covariates = bool(getattr(self.args, 'no_future_covariates', False))
+        if no_future_covariates:
+            if batch_x is None:
+                raise ValueError('batch_x is required when no_future_covariates is enabled')
+            last_observed = batch_x[:, -1:, :].to(device=dec_inp.device, dtype=dec_inp.dtype)
+            dec_inp[:, -pred_len:, :] = last_observed.expand(-1, pred_len, -1)
+
         idx_list = getattr(self.args, 'loss_target_indices', None)
         if not idx_list:
             # 兜底：没有 target 索引时，退化为 TSL 默认逻辑（pred 段全 0），并且不产生 mask
@@ -169,7 +177,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         dec_mask[:, :, idx] = True
         return dec_inp, dec_mask
 
-    def _build_decoder_input(self, batch_y):
+    def _build_decoder_input(self, batch_y, batch_x=None):
         """
         构造 decoder 输入（dec_inp）。
 
@@ -189,7 +197,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         # - non-target（外生变量）：输入 label_len+pred_len 真值；
         # - target（内生变量）：输入 label_len 真值 + pred_len 用 label 段均值占位符
         if model_name == 'Crossformer' and getattr(self.args, 'loss_target_indices', None):
-            dec_inp, _ = self._build_crossformer_decoder_input_and_mask(batch_y)
+            dec_inp, _ = self._build_crossformer_decoder_input_and_mask(batch_y, batch_x=batch_x)
             return dec_inp
 
         # 默认（原版 TSL）：label 段真值 + pred 段全 0
@@ -295,7 +303,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 # decoder input
                 dec_mask = None
                 if getattr(self.args, 'model', None) == 'Crossformer' and getattr(self.args, 'loss_target_indices', None):
-                    dec_inp, dec_mask = self._build_crossformer_decoder_input_and_mask(batch_y)
+                    dec_inp, dec_mask = self._build_crossformer_decoder_input_and_mask(batch_y, batch_x=batch_x)
                     if not bool(getattr(self.args, 'use_dec_mask_embedding', True)):
                         dec_mask = None
                 else:
@@ -484,7 +492,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 # decoder input
                 dec_mask = None
                 if getattr(self.args, 'model', None) == 'Crossformer' and getattr(self.args, 'loss_target_indices', None):
-                    dec_inp, dec_mask = self._build_crossformer_decoder_input_and_mask(batch_y)
+                    dec_inp, dec_mask = self._build_crossformer_decoder_input_and_mask(batch_y, batch_x=batch_x)
                     if not bool(getattr(self.args, 'use_dec_mask_embedding', True)):
                         dec_mask = None
                 else:
@@ -632,7 +640,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 # decoder input
                 dec_mask = None
                 if getattr(self.args, 'model', None) == 'Crossformer' and getattr(self.args, 'loss_target_indices', None):
-                    dec_inp, dec_mask = self._build_crossformer_decoder_input_and_mask(batch_y)
+                    dec_inp, dec_mask = self._build_crossformer_decoder_input_and_mask(batch_y, batch_x=batch_x)
                     if not bool(getattr(self.args, 'use_dec_mask_embedding', True)):
                         dec_mask = None
                 else:

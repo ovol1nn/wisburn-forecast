@@ -49,7 +49,8 @@ VM_TRAINING_PROFILES = {
         "patch_len": 8,
         "loss_trend_weight": 0.25,
         "loss_endpoint_weight": 0.5,
-        "des": "xingrong3_model1_10s_trend_endpoint_v1",
+        "no_future_covariates": True,
+        "des": "xingrong3_model1_10s_history_only_v1",
     },
     "model2_10s": {
         "model_slug": "model2",
@@ -67,6 +68,7 @@ VM_TRAINING_PROFILES = {
         "d_layers": 1,
         "d_ff": 256,
         "patch_len": 16,
+        "no_future_covariates": False,
         "des": "xingrong3_model2_10s_v1",
     },
 }
@@ -209,6 +211,8 @@ def build_command(metadata: dict, ready_dir: Path) -> list[str]:
         cmd.append("--use_amp")
     if INTERACTIVE_FAIL_ON_NONFINITE:
         cmd.append("--fail_on_nonfinite")
+    if PROFILE.get("no_future_covariates", False):
+        cmd.append("--no_future_covariates")
     if INTERACTIVE_USE_MULTI_GPU:
         cmd.extend(["--use_multi_gpu", "--devices", INTERACTIVE_DEVICES])
     return cmd
