@@ -20,6 +20,8 @@
 
 ## 当前模型
 
+2026-10-22补充：模型1历史输入训练版已形成可独立调用的离线候选，见[inference/README.md](inference/README.md)。它保留14目标，新增预热温度的历史状态门控短时修正、输入校验和明确降级；不依赖未来真实工况，不替换当前Profile或历史发布bundle。模型2不在本次改动范围。候选权重、验收结果及独立调用包位于forecast artifacts的`candidates/model1_history_only_guarded_v1_20261022/`。
+
 | 模型 | 关注范围 | 输入 | 输出 | 预测目标 |
 | --- | --- | --- | --- | --- |
 | `model1` | 炉膛燃烧和蒸汽工况 | 过去 20 分钟：120 个 10 秒点 | 未来 10 分钟：60 个 10 秒点 | 当前配置 14 个工况目标，包括主蒸汽、氧量/温度、负压、汽包水位和压力等 |
@@ -66,6 +68,7 @@ offline/forecast/
 ├─ tslib/             训练使用的 Crossformer / TSLib 源码
 ├─ contracts/         特征、目标和时间窗口契约
 ├─ confidence/        当前发布模型的逐目标、逐时域置信度校准与图表
+├─ inference/         新训练模型的独立离线候选推理与短时修正，不接入控制
 ├─ reports/           离线预测效果与训练报告
 ├─ inputs/            外部 Silver 数据和点位表说明
 └─ tests/             路径与契约测试
