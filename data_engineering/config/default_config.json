@@ -10,15 +10,16 @@
   "constant_ratio_warn": 0.95,
   "zero_abs_tolerance": 1e-9,
   "zero_ratio_warn": 0.95,
+  "model_preprocessing_policy": "strict_raw_complete_windows_v1",
   "quantile_outlier_filter": {
-    "enabled": true,
+    "enabled": false,
     "lower_quantile": 0.25,
     "upper_quantile": 0.75,
     "iqr_multiplier": 3.0,
     "min_non_null_rows": 100
   },
   "input_spike_filter": {
-    "enabled": true,
+    "enabled": false,
     "lower_quantile": 0.25,
     "upper_quantile": 0.75,
     "iqr_multiplier": 3.0,
@@ -38,8 +39,8 @@
   "low_information_constant_ratio_drop": 0.98,
   "low_information_zero_ratio_drop": 0.98,
   "low_information_keep_point_codes": [],
-  "collective_missing_rate_warn": 0.4,
-  "min_valid_model_columns_rate": 0.65,
+  "collective_missing_rate_warn": 0.0,
+  "min_valid_model_columns_rate": 1.0,
   "training_exclusion_buffer_seconds": 3600,
   "long_common_low_anomaly": {
     "enabled": true,
@@ -57,9 +58,9 @@
   "window_seq_len": 1200,
   "window_pred_len": 600,
   "window_stride": 1,
-  "target_forward_fill_limit": 5,
-  "input_interpolate_limit": 6,
-  "input_forward_fill_limit": 30,
+  "target_forward_fill_limit": 0,
+  "input_interpolate_limit": 0,
+  "input_forward_fill_limit": 0,
   "model_overrides": {},
   "pollutant_ranges": {
     "SO2": [0, 300],

@@ -68,8 +68,8 @@ VM_TRAINING_PROFILES = {
         "d_layers": 1,
         "d_ff": 256,
         "patch_len": 16,
-        "no_future_covariates": False,
-        "des": "xingrong3_model2_10s_v1",
+        "no_future_covariates": True,
+        "des": "xingrong3_model2_10s_history_only_v1",
     },
 }
 PROFILE = VM_TRAINING_PROFILES[INTERACTIVE_TRAINING_PROFILE]

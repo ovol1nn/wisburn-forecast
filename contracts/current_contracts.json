@@ -1,23 +1,30 @@
 {
   "plant": "xingrong_3",
-  "source_of_truth": "assets/profiles/xingrong_3/plant_profile.yaml and released bundle metadata.json",
+  "source_of_truth": "offline/forecast/training/TRAINING_SPEC.md, run_chunked_tslib_training.py, and an approved metadata.json",
   "models": {
     "model1": {
       "native_step_seconds": 10,
       "seq_len": 120,
       "label_len": 60,
       "pred_len": 60,
-      "feature_count": 300,
-      "target_columns": ["B3_F80.PV", "B3QT00", "B3_O2_S1", "B3_TE1119", "B3_GIC01"],
-      "target_indices": [28, 29, 30, 31, 32]
+      "feature_count": 304,
+      "output_count": 14,
+      "logical_target_count": 12,
+      "history_only": true,
+      "target_columns": ["B3_F80.PV", "B3QT00", "B3_O2_S1", "B3_TE1119", "B3_GIC01", "B3_DRUMLT1", "B3_DRUMLT2", "B3_DRUMLT3", "B3PT04A", "B3PT04B", "B3PT81A", "B3PT81B", "B3TE03", "B3TE86B"],
+      "paired_logical_targets": [["B3PT04A", "B3PT04B"], ["B3PT81A", "B3PT81B"]],
+      "target_indices": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     },
     "model2": {
-      "native_step_seconds": 1,
-      "seq_len": 1200,
-      "label_len": 600,
-      "pred_len": 600,
-      "feature_count": 109,
-      "target_columns": ["B3QT02BBC", "B3QT02CBC", "B3QT02EBC", "B3QT02ABC", "B3QT02FC2"]
+      "native_step_seconds": 10,
+      "seq_len": 120,
+      "label_len": 60,
+      "pred_len": 60,
+      "feature_count": 113,
+      "output_count": 5,
+      "history_only": true,
+      "target_columns": ["B3QT02BBC", "B3QT02CBC", "B3QT02EBC", "B3QT02ABC", "B3QT02FC2"],
+      "target_indices": [3, 4, 5, 6, 7]
     }
   }
 }

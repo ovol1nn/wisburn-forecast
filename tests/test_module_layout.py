@@ -12,14 +12,17 @@ WORKSPACE_ROOT = MODULE_ROOT.parents[1]
 class ForecastModuleLayoutTests(unittest.TestCase):
     def test_contract_has_two_current_models(self) -> None:
         contract = json.loads((MODULE_ROOT / "contracts" / "current_contracts.json").read_text(encoding="utf-8"))
-        self.assertEqual(contract["models"]["model1"]["seq_len"], 120)
-        self.assertEqual(contract["models"]["model1"]["pred_len"], 60)
-        self.assertEqual(contract["models"]["model1"]["native_step_seconds"], 10)
-        self.assertEqual(contract["models"]["model2"]["seq_len"], 1200)
-        self.assertEqual(contract["models"]["model2"]["pred_len"], 600)
-        self.assertEqual(contract["models"]["model2"]["native_step_seconds"], 1)
-        self.assertEqual(len(contract["models"]["model1"]["target_columns"]), 5)
-        self.assertEqual(len(contract["models"]["model2"]["target_columns"]), 5)
+        for model in contract["models"].values():
+            self.assertEqual(model["seq_len"], 120)
+            self.assertEqual(model["label_len"], 60)
+            self.assertEqual(model["pred_len"], 60)
+            self.assertEqual(model["native_step_seconds"], 10)
+            self.assertTrue(model["history_only"])
+            self.assertEqual(model["output_count"], len(model["target_columns"]))
+            self.assertEqual(model["output_count"], len(model["target_indices"]))
+        self.assertEqual(contract["models"]["model1"]["output_count"], 14)
+        self.assertEqual(contract["models"]["model1"]["logical_target_count"], 12)
+        self.assertEqual(contract["models"]["model2"]["output_count"], 5)
 
     def test_source_module_has_no_generated_training_output(self) -> None:
         self.assertFalse((MODULE_ROOT / "training_ready").exists())
@@ -42,6 +45,12 @@ class ForecastModuleLayoutTests(unittest.TestCase):
         self.assertIn('"offline" / "forecast" / "tslib"', runner)
         self.assertNotIn("PROJECT_DIR", bridge)
         self.assertNotIn("PROJECT_DIR", runner)
+
+    def test_model2_training_profile_enables_history_only_decoding(self) -> None:
+        runner = (MODULE_ROOT / "training" / "run_chunked_tslib_training.py").read_text(encoding="utf-8")
+        profile = runner.split('"model2_10s": {', 1)[1].split("\n    },", 1)[0]
+        self.assertIn('"no_future_covariates": True', profile)
+        self.assertIn('cmd.append("--no_future_covariates")', runner)
 
     def test_report_scripts_read_artifact_root(self) -> None:
         for script in (

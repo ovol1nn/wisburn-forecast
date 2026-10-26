@@ -509,7 +509,7 @@ def resample_point(
             TIMESTAMP '1970-01-01'
                 + CAST(ceil(epoch(timestamp) / {freq_seconds}) * {freq_seconds} AS BIGINT) * INTERVAL '1 second'
                 AS timestamp,
-            avg(value) AS value,
+            CASE WHEN count(*) = {freq_seconds} THEN avg(value) ELSE NULL END AS value,
             count(*) AS raw_count
         FROM read_parquet('{sql_path(source_path)}')
         WHERE {where_sql}
@@ -585,7 +585,10 @@ def build_point_caches(
     codes = point_codes_for_models(specs, models, cfg)
     if limit_points > 0:
         codes = codes[:limit_points]
-    param_id = params_hash({"freq_seconds": freq_seconds, "start": start, "end": end})
+    param_id = params_hash({
+        "freq_seconds": freq_seconds, "start": start, "end": end,
+        "bucket_policy": "exact_raw_count_v1",
+    })
     con = duckdb.connect(":memory:")
     quality_rows: list[dict[str, Any]] = []
     built_codes: list[str] = []
@@ -740,28 +743,6 @@ def merge_wide_table(
     return wide.sort_values("timestamp", kind="stable").reset_index(drop=True)
 
 
-def deadband_filter(pd: Any, series: Any, threshold_pct: float = 0.04, min_abs_diff: float | None = None) -> Any:
-    data = series.to_numpy(dtype=float, copy=True)
-    if len(data) == 0 or bool(pd.isna(data).all()):
-        return series
-    valid = ~pd.isna(data)
-    first = int(valid.argmax())
-    current = float(data[first])
-    out = data.copy()
-    out[: first + 1] = current
-    for i in range(first + 1, len(data)):
-        if pd.isna(data[i]):
-            out[i] = current
-            continue
-        threshold = max(abs(current) * threshold_pct, 1e-6)
-        if min_abs_diff is not None:
-            threshold = max(threshold, min_abs_diff)
-        if abs(float(data[i]) - current) > threshold:
-            current = float(data[i])
-        out[i] = current
-    return pd.Series(out, index=series.index)
-
-
 def add_derived_features(pd: Any, df: Any, cfg: dict[str, Any]) -> tuple[Any, list[dict[str, str]]]:
     out = df.copy()
     notes: list[dict[str, str]] = []
@@ -775,7 +756,6 @@ def add_derived_features(pd: Any, df: Any, cfg: dict[str, Any]) -> tuple[Any, li
             continue
         if sources:
             out[name] = out[sources].mean(axis=1)
-            out[name] = deadband_filter(pd, out[name], threshold_pct=0.04, min_abs_diff=200)
             section_cols.append(name)
         else:
             notes.append({"feature": name, "status": "missing_all_sources", "sources": ",".join(item.get("sources", []))})
@@ -787,14 +767,10 @@ def add_derived_features(pd: Any, df: Any, cfg: dict[str, Any]) -> tuple[Any, li
         for idx, col in enumerate(section_cols, 1):
             ratio = f"primary_air_section_{idx}_ratio"
             out[ratio] = out[col] / denom
-            out[ratio] = deadband_filter(pd, out[ratio], threshold_pct=0.05)
 
         secondary = derived.get("secondary_air_flow")
         if secondary in out.columns:
             out["primary_air_ratio_primary_secondary"] = out[total_name] / (out[total_name] + out[secondary] + 1e-5)
-            out["primary_air_ratio_primary_secondary"] = deadband_filter(
-                pd, out["primary_air_ratio_primary_secondary"], threshold_pct=0.05
-            )
         else:
             notes.append({"feature": "primary_air_ratio_primary_secondary", "status": "missing_secondary_air", "sources": str(secondary)})
 
@@ -809,14 +785,12 @@ def add_derived_features(pd: Any, df: Any, cfg: dict[str, Any]) -> tuple[Any, li
     pusher_sources = [c for c in derived.get("pusher_position_sources", []) if c in out.columns]
     if pusher_sources:
         out["pusher_position_mean"] = out[pusher_sources].mean(axis=1)
-        out["pusher_position_mean"] = deadband_filter(pd, out["pusher_position_mean"], threshold_pct=0.04, min_abs_diff=2)
 
     for item in derived.get("grate_speed_groups", []):
         sources = [c for c in item.get("sources", []) if c in out.columns]
         name = item.get("name")
         if name and sources:
             out[name] = out[sources].mean(axis=1)
-            out[name] = deadband_filter(pd, out[name], threshold_pct=0.04, min_abs_diff=2)
 
     return out, notes
 
@@ -844,25 +818,17 @@ def derived_feature_names(cfg: dict[str, Any]) -> list[str]:
 
 
 def robust_clean_series(pd: Any, series: Any, *, min_val: float | None = None, max_val: float | None = None) -> Any:
+    """Apply only fixed engineering bounds; never infer limits from future rows."""
     s = series.copy()
     if min_val is not None:
         s[s < min_val] = pd.NA
     if max_val is not None:
         s[s > max_val] = pd.NA
-    if s.isna().all():
-        return s
-    diff = s.diff().abs()
-    diff_med = diff.median(skipna=True)
-    if diff_med and not math.isnan(float(diff_med)) and float(diff_med) > 0:
-        s[diff > float(diff_med) * 10.0] = pd.NA
-    median = s.rolling(window=15, center=False, min_periods=3).median()
-    mad = (s - median).abs().rolling(window=15, center=False, min_periods=3).median()
-    mask = (s - median).abs() > (3 * 1.4826 * mad + 1e-6)
-    s[mask.fillna(False)] = pd.NA
     return s
 
 
 def quantile_iqr_clean_series(pd: Any, series: Any, settings: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+    """Retained for audit compatibility; strict model windows do not impute or trim by global quantiles."""
     s = series.copy()
     non_null = s.dropna()
     audit: dict[str, Any] = {
@@ -875,46 +841,13 @@ def quantile_iqr_clean_series(pd: Any, series: Any, settings: dict[str, Any]) ->
         "upper_fence": math.nan,
         "outside_fence_rows": 0,
         "isolated_outliers_removed": 0,
-        "status": "disabled",
+        "status": "not_applied_strict_raw_window",
     }
-    if not settings.get("enabled", True):
-        return s, audit
-    if len(non_null) < int(settings.get("min_non_null_rows", 100)):
-        audit["status"] = "insufficient_samples"
-        return s, audit
-
-    q_low = float(settings.get("lower_quantile", 0.25))
-    q_high = float(settings.get("upper_quantile", 0.75))
-    q1 = float(non_null.quantile(q_low))
-    q3 = float(non_null.quantile(q_high))
-    iqr = q3 - q1
-    audit.update({"q1": q1, "q3": q3, "iqr": iqr})
-    if not math.isfinite(iqr) or iqr <= 0:
-        audit["status"] = "zero_or_invalid_iqr"
-        return s, audit
-
-    multiplier = float(settings.get("iqr_multiplier", 3.0))
-    lower = q1 - multiplier * iqr
-    upper = q3 + multiplier * iqr
-    outside = (s < lower) | (s > upper)
-    inside_previous = s.shift(1).between(lower, upper).fillna(False)
-    inside_next = s.shift(-1).between(lower, upper).fillna(False)
-    isolated = outside.fillna(False) & inside_previous & inside_next
-    audit.update(
-        {
-            "lower_fence": lower,
-            "upper_fence": upper,
-            "outside_fence_rows": int(outside.sum()),
-            "isolated_outliers_removed": int(isolated.sum()),
-            "status": "applied",
-        }
-    )
-    s[isolated] = pd.NA
     return s, audit
 
 
 def isolated_input_spike_clean_series(pd: Any, series: Any, settings: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
-    """Mask one-sample spikes that diverge from a robust local baseline."""
+    """Strict model inputs keep source samples unchanged; suspect windows are rejected downstream."""
     s = series.copy()
     audit: dict[str, Any] = {
         "rows": int(len(s)),
@@ -923,76 +856,9 @@ def isolated_input_spike_clean_series(pd: Any, series: Any, settings: dict[str, 
         "lower_fence": math.nan,
         "upper_fence": math.nan,
         "isolated_spikes_masked": 0,
-        "strategy": "disabled",
-        "status": "disabled",
+        "strategy": "strict_raw_window",
+        "status": "not_applied_strict_raw_window",
     }
-    if not settings.get("enabled", True):
-        return s, audit
-
-    window = max(3, int(settings.get("window_points", 15)))
-    if window % 2 == 0:
-        window += 1
-    min_periods = min(window, max(3, int(settings.get("min_periods", 5))))
-    median = s.rolling(window=window, center=True, min_periods=min_periods).median()
-    local_mad = (s - median).abs().rolling(window=window, center=True, min_periods=min_periods).median()
-    local_sigma = local_mad * 1.4826
-    absolute_floor = max(0.0, float(settings.get("absolute_floor", 1e-6)))
-    spike_sigma = float(settings.get("spike_sigma", 8.0))
-    neighbor_sigma = float(settings.get("neighbor_sigma", 3.0))
-    nonzero_steps = s.diff().abs()
-    nonzero_steps = nonzero_steps[nonzero_steps > 0]
-    min_step_count = max(1, int(settings.get("min_step_count", 20)))
-    typical_step = float(nonzero_steps.median()) if len(nonzero_steps) >= min_step_count else 0.0
-    spike_floor = max(absolute_floor, typical_step * float(settings.get("minimum_step_multiple", 4.0)))
-    neighbor_floor = max(absolute_floor, typical_step * float(settings.get("neighbor_step_multiple", 2.0)))
-    previous = s.shift(1)
-    following = s.shift(-1)
-    neighbor_tolerance = neighbor_sigma * local_sigma + neighbor_floor
-    neighbor_confirms_isolated = (
-        ((previous - median).abs() <= neighbor_tolerance)
-        | ((following - median).abs() <= neighbor_tolerance)
-    )
-    spike = (
-        s.notna()
-        & previous.notna()
-        & following.notna()
-        & median.notna()
-        & ((s - median).abs() > (spike_sigma * local_sigma + spike_floor))
-        & neighbor_confirms_isolated
-    )
-    non_null = s.dropna()
-    q1 = float(non_null.quantile(float(settings.get("lower_quantile", 0.25)))) if not non_null.empty else math.nan
-    q3 = float(non_null.quantile(float(settings.get("upper_quantile", 0.75)))) if not non_null.empty else math.nan
-    iqr = q3 - q1
-    if math.isfinite(iqr) and iqr > 0:
-        multiplier = float(settings.get("iqr_multiplier", 3.0))
-        lower_fence = q1 - multiplier * iqr
-        upper_fence = q3 + multiplier * iqr
-        spike &= (s < lower_fence) | (s > upper_fence)
-        strategy = "iqr_fence_and_local_isolation"
-    else:
-        lower_fence = math.nan
-        upper_fence = math.nan
-        strategy = "local_fallback_zero_iqr"
-    spike = spike.fillna(False)
-    audit.update(
-        {
-            "window_points": window,
-            "spike_sigma": spike_sigma,
-            "q1": q1,
-            "q3": q3,
-            "iqr": iqr,
-            "lower_fence": lower_fence,
-            "upper_fence": upper_fence,
-            "typical_step": typical_step,
-            "nonzero_step_count": int(len(nonzero_steps)),
-            "spike_floor": spike_floor,
-            "isolated_spikes_masked": int(spike.sum()),
-            "strategy": strategy,
-            "status": "applied",
-        }
-    )
-    s[spike] = pd.NA
     return s, audit
 
 
@@ -1016,56 +882,23 @@ def clean_model_frame(
     quantile_audit: list[dict[str, Any]] | None = None,
     input_spike_audit: list[dict[str, Any]] | None = None,
 ) -> Any:
-    out = df.copy()
-    active_model = model or (specs[0].model if specs else None)
-    by_code = {s.point_code: s for s in specs}
-    targets = [s.point_code for s in specs if is_output_role(s.io_type) and s.point_code in out.columns]
-    inputs = [s.point_code for s in specs if is_input_role(s.io_type) and s.point_code in out.columns]
-    input_features = unique_in_order(
-        inputs
-        + [code for code in derived_source_codes(cfg) if code in out.columns and code not in targets]
-        + [name for name in derived_feature_names(cfg) if name in out.columns]
-    )
-
-    for code in targets + inputs:
-        spec = by_code.get(code)
-        if not spec:
-            continue
-        if is_output_role(spec.io_type):
-            out[code], audit = quantile_iqr_clean_series(
-                pd,
-                out[code],
-                cfg.get("quantile_outlier_filter", {}),
-            )
-            if quantile_audit is not None:
-                quantile_audit.append({"point_code": code, **audit})
-        min_val, max_val = range_for_spec(spec, cfg)
-        if min_val is not None or max_val is not None or is_output_role(spec.io_type):
-            out[code] = robust_clean_series(pd, out[code], min_val=min_val, max_val=max_val)
-
-    for code in input_features:
-        out[code], audit = isolated_input_spike_clean_series(
-            pd,
-            out[code],
-            cfg.get("input_spike_filter", {}),
+    # Keep the model data identical to the observed source values. The runtime
+    # window rejects missing/bad inputs, so training must not impute or smooth.
+    if quantile_audit is not None:
+        quantile_audit.extend({
+            "point_code": spec.point_code, "status": "not_applied_strict_raw_window",
+            "rows": int(len(df)), "non_null_rows": int(df[spec.point_code].notna().sum()) if spec.point_code in df else 0,
+        } for spec in specs if is_output_role(spec.io_type))
+    if input_spike_audit is not None:
+        codes = unique_in_order(
+            [spec.point_code for spec in specs if is_input_role(spec.io_type)]
+            + list(derived_source_codes(cfg)) + derived_feature_names(cfg)
         )
-        if input_spike_audit is not None:
-            input_spike_audit.append({"point_code": code, **audit})
-
-    # Targets must remain causal: trailing smoothing and limited ffill only.
-    for code in targets:
-        out[code] = out[code].rolling(window=3, center=False, min_periods=1).mean()
-        out[code] = out[code].ffill(limit=int(cfg_value(cfg, "target_forward_fill_limit", 5, active_model)))
-
-    # Inputs can use short interpolation because they are known covariates/states.
-    if input_features:
-        out[input_features] = out[input_features].interpolate(
-            method="linear",
-            limit=int(cfg_value(cfg, "input_interpolate_limit", 6, active_model)),
-            limit_direction="both",
-        )
-        out[input_features] = out[input_features].ffill(limit=int(cfg_value(cfg, "input_forward_fill_limit", 30, active_model)))
-    return out
+        input_spike_audit.extend({
+            "point_code": code, "status": "not_applied_strict_raw_window",
+            "rows": int(len(df)), "non_null_rows": int(df[code].notna().sum()) if code in df else 0,
+        } for code in codes)
+    return df.copy()
 
 
 def quality_summary(pd: Any, df: Any, point_codes: list[str], cfg: dict[str, Any]) -> Any:
@@ -1380,9 +1213,16 @@ def build_training_mask(
     freq_seconds: int,
     common_low_score: Any | None = None,
     model: str | None = None,
+    exclude_model_codes: Iterable[str] = (),
 ) -> Any:
     mask = pd.DataFrame({"timestamp": df["timestamp"]})
-    existing = [c for c in model_point_codes if c in df.columns]
+    excluded = set(exclude_model_codes)
+    required_codes = unique_in_order(
+        [code for code in model_point_codes if code not in excluded]
+        + (list(derived_source_codes(cfg)) + derived_feature_names(cfg) if model == "子模型1" else [])
+    )
+    missing_columns = set(required_codes) - set(df.columns)
+    existing = [c for c in required_codes if c in df.columns]
     if existing:
         mask["model_valid_rate"] = df[existing].notna().mean(axis=1)
         mask["collective_missing_rate"] = df[existing].isna().mean(axis=1)
@@ -1390,8 +1230,8 @@ def build_training_mask(
         mask["model_valid_rate"] = 0.0
         mask["collective_missing_rate"] = 1.0
 
-    mask["bad_collective_missing"] = mask["collective_missing_rate"] >= float(cfg.get("collective_missing_rate_warn", 0.4))
-    mask["bad_low_valid_rate"] = mask["model_valid_rate"] < float(cfg.get("min_valid_model_columns_rate", 0.65))
+    mask["bad_collective_missing"] = mask["collective_missing_rate"] > 0.0
+    mask["bad_low_valid_rate"] = (mask["model_valid_rate"] < 1.0) | bool(missing_columns)
     if output_codes:
         mask["bad_target_missing"] = df[output_codes].isna().any(axis=1)
     else:
@@ -1606,30 +1446,43 @@ def global_quality_from_caches(
     point_codes: list[str],
     cfg: dict[str, Any],
     *,
+    freq_seconds: int,
     start: Any | None = None,
     end: Any | None = None,
 ) -> Any:
     rows = []
     zero_abs_tolerance = float(cfg.get("zero_abs_tolerance", 1e-9))
+    expected_rows = 0
+    if start is not None and end is not None:
+        expected_rows = max(0, int(math.ceil((pd.Timestamp(end) - pd.Timestamp(start)).total_seconds()
+                                              / max(1, int(freq_seconds)))))
     for idx, code in enumerate(point_codes, 1):
         path = cache_path(paths, code)
         if not path.exists():
-            rows.append({"point_code": code, "status": "missing_column"})
+            rows.append({"point_code": code, "status": "missing_column", "rows": expected_rows,
+                         "observed_rows": 0, "non_null_rows": 0, "missing_rate": 1.0,
+                         "zero_ratio": 1.0, "constant_ratio": 1.0,
+                         "warn_missing": True, "warn_zero": True, "warn_constant": True})
             continue
         frame = read_cached_series(pd, paths, code, start=start, end=end)
         if frame is None or code not in frame.columns:
-            rows.append({"point_code": code, "status": "missing_column"})
+            rows.append({"point_code": code, "status": "missing_column", "rows": expected_rows,
+                         "observed_rows": 0, "non_null_rows": 0, "missing_rate": 1.0,
+                         "zero_ratio": 1.0, "constant_ratio": 1.0,
+                         "warn_missing": True, "warn_zero": True, "warn_constant": True})
             continue
         s = frame[code]
         non_null = int(s.notna().sum())
         values = s.dropna()
         zero_ratio = float((values.abs() <= zero_abs_tolerance).mean()) if non_null else 1.0
         constant_ratio = float(values.value_counts(dropna=True, normalize=True).iloc[0]) if non_null else 1.0
-        missing_rate = float(1 - non_null / len(s)) if len(s) else 1.0
+        denominator = expected_rows or len(s)
+        missing_rate = float(max(0.0, 1 - non_null / denominator)) if denominator else 1.0
         rows.append(
             {
                 "point_code": code,
-                "rows": int(len(s)),
+                "rows": int(denominator),
+                "observed_rows": int(len(s)),
                 "non_null_rows": non_null,
                 "missing_rate": missing_rate,
                 "zero_ratio": zero_ratio,
@@ -1689,7 +1542,9 @@ def build_model_dataset_chunked(
     print(f"chunked build for {model}: {len(model_codes)} model points", flush=True)
     print(f"range: {full_start} -> {full_end}; chunk_days={chunk_days}", flush=True)
     report_range_suffix = chunk_range_suffix
-    q = global_quality_from_caches(pd, paths, model_codes, cfg, start=full_start, end=full_end)
+    q = global_quality_from_caches(
+        pd, paths, model_codes, cfg, freq_seconds=freq_seconds, start=full_start, end=full_end
+    )
     q_path = report_path(paths, "quality", f"{slug}_quality_{freq_seconds}s{report_range_suffix}.csv", slug)
     q.to_csv(q_path, index=False, encoding="utf-8-sig")
     low_info = low_information_inputs(pd, q, model_specs, cfg)
@@ -1740,6 +1595,7 @@ def build_model_dataset_chunked(
                 "input_interpolate_limit": cfg_value(cfg, "input_interpolate_limit", 6, model),
                 "input_forward_fill_limit": cfg_value(cfg, "input_forward_fill_limit", 30, model),
                 "input_spike_filter": cfg.get("input_spike_filter", {}),
+                "model_preprocessing_policy": cfg.get("model_preprocessing_policy", "legacy"),
                 "training_exclusion_buffer_seconds": cfg_value(cfg, "training_exclusion_buffer_seconds", 0, model),
                 "shutdown_indicators": cfg.get("shutdown_indicators", []),
                 "quantile_outlier_filter": cfg.get("quantile_outlier_filter", {}),
@@ -1806,6 +1662,7 @@ def build_model_dataset_chunked(
             freq_seconds=freq_seconds,
             common_low_score=common_low_score,
             model=model,
+            exclude_model_codes=stable_drop_cols + stable_bad_outputs,
         )
         training_frame = wide.copy()
         training_frame["valid_for_training"] = training_mask["valid_for_training"].to_numpy()
@@ -2003,6 +1860,7 @@ def build_model_dataset(
         freq_seconds=freq_seconds,
         common_low_score=common_low_score,
         model=model,
+        exclude_model_codes=(low_info["point_code"].tolist() if not low_info.empty else []) + stable_bad_outputs,
     )
     training_frame = wide.copy()
     training_frame["valid_for_training"] = training_mask["valid_for_training"].to_numpy()
@@ -2210,11 +2068,7 @@ def clean_existing_chunked_input_spikes(args: argparse.Namespace) -> int:
             )
             masked_count = int(audit["isolated_spikes_masked"])
             total_spikes += masked_count
-            frame[code] = cleaned.interpolate(
-                method="linear",
-                limit=int(cfg_value(cfg, "input_interpolate_limit", 6, model)),
-                limit_direction="both",
-            ).ffill(limit=int(cfg_value(cfg, "input_forward_fill_limit", 30, model)))
+            frame[code] = cleaned
             audit_rows.append({"chunk_id": chunk_id, "point_code": code, **audit})
 
         valid_after = int(frame["valid_for_training"].fillna(False).astype(bool).sum())
