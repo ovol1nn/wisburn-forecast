@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import argparse
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -105,9 +107,10 @@ INTERACTIVE_LOSS_TREND_WEIGHT = PROFILE.get("loss_trend_weight", 0.0)
 INTERACTIVE_LOSS_ENDPOINT_WEIGHT = PROFILE.get("loss_endpoint_weight", 0.0)
 INTERACTIVE_USE_GPU = True
 INTERACTIVE_GPU = 0
-INTERACTIVE_USE_MULTI_GPU = True
+INTERACTIVE_USE_MULTI_GPU = False
 INTERACTIVE_DEVICES = "0,1"
 INTERACTIVE_DES = PROFILE["des"]
+INTERACTIVE_CHECKPOINT_ROOT: Path | None = None
 INTERACTIVE_PRINT_EVERY = 100
 INTERACTIVE_RESUME_TRAINING = False
 INTERACTIVE_RESUME_CHECKPOINT = ""  # empty means checkpoints/<setting>/resume_state.pth
@@ -140,6 +143,8 @@ def build_command(metadata: dict, ready_dir: Path) -> list[str]:
         "custom_chunked",
         "--root_path",
         str(root_path),
+        "--checkpoints",
+        str((INTERACTIVE_CHECKPOINT_ROOT or (ready_dir / "checkpoints")).resolve()),
         "--data_path",
         "metadata.json",
         "--features",
@@ -294,6 +299,65 @@ def validate_training_runtime() -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="为 Model 1/2 准备或运行 history-only 分块训练")
+    parser.add_argument("--profile", choices=sorted(VM_TRAINING_PROFILES), default="model2_10s")
+    parser.add_argument("--run-tag", default=None, help="训练唯一标识；默认使用当前时间，产物写入独立目录")
+    parser.add_argument("--run", action="store_true", help="实际启动训练；缺省只准备、检查数据并输出命令")
+    parser.add_argument("--cpu", action="store_true", help="显式使用 CPU")
+    parser.add_argument("--multi-gpu", action="store_true", help="显式启用多卡训练")
+    parser.add_argument("--devices", default="0,1", help="多卡设备编号，例如 0,1")
+    args = parser.parse_args()
+    if args.cpu and args.multi_gpu:
+        raise SystemExit("--cpu 与 --multi-gpu 不能同时使用")
+
+    global PROFILE, INTERACTIVE_TRAINING_PROFILE, INTERACTIVE_MODEL_SLUG
+    global INTERACTIVE_FREQ_SECONDS, INTERACTIVE_SEQ_LEN, INTERACTIVE_LABEL_LEN
+    global INTERACTIVE_PRED_LEN, INTERACTIVE_TSLIB_MODEL, INTERACTIVE_FEATURES
+    global INTERACTIVE_EPOCHS, INTERACTIVE_PATIENCE, INTERACTIVE_BATCH_SIZE
+    global INTERACTIVE_LEARNING_RATE, INTERACTIVE_D_MODEL, INTERACTIVE_N_HEADS
+    global INTERACTIVE_E_LAYERS, INTERACTIVE_D_LAYERS, INTERACTIVE_D_FF
+    global INTERACTIVE_PATCH_LEN, INTERACTIVE_LOSS_TREND_WEIGHT, INTERACTIVE_LOSS_ENDPOINT_WEIGHT
+    global INTERACTIVE_DES, INTERACTIVE_USE_GPU, INTERACTIVE_USE_MULTI_GPU
+    global INTERACTIVE_DEVICES, INTERACTIVE_GPU, INTERACTIVE_RUN_TRAINING
+    global INTERACTIVE_CHECKPOINT_ROOT
+
+    INTERACTIVE_TRAINING_PROFILE = args.profile
+    PROFILE = VM_TRAINING_PROFILES[args.profile]
+    INTERACTIVE_MODEL_SLUG = PROFILE["model_slug"]
+    INTERACTIVE_FREQ_SECONDS = PROFILE["freq_seconds"]
+    INTERACTIVE_SEQ_LEN = PROFILE["seq_len"]
+    INTERACTIVE_LABEL_LEN = PROFILE["label_len"]
+    INTERACTIVE_PRED_LEN = PROFILE["pred_len"]
+    INTERACTIVE_TSLIB_MODEL = "Crossformer"
+    INTERACTIVE_FEATURES = "M"
+    INTERACTIVE_EPOCHS = PROFILE["epochs"]
+    INTERACTIVE_PATIENCE = PROFILE["patience"]
+    INTERACTIVE_BATCH_SIZE = PROFILE["batch_size"]
+    INTERACTIVE_LEARNING_RATE = PROFILE["learning_rate"]
+    INTERACTIVE_D_MODEL = PROFILE["d_model"]
+    INTERACTIVE_N_HEADS = PROFILE["n_heads"]
+    INTERACTIVE_E_LAYERS = PROFILE["e_layers"]
+    INTERACTIVE_D_LAYERS = PROFILE["d_layers"]
+    INTERACTIVE_D_FF = PROFILE["d_ff"]
+    INTERACTIVE_PATCH_LEN = PROFILE["patch_len"]
+    INTERACTIVE_LOSS_TREND_WEIGHT = PROFILE.get("loss_trend_weight", 0.0)
+    INTERACTIVE_LOSS_ENDPOINT_WEIGHT = PROFILE.get("loss_endpoint_weight", 0.0)
+    INTERACTIVE_DES = PROFILE["des"]
+    INTERACTIVE_USE_GPU = not args.cpu
+    INTERACTIVE_USE_MULTI_GPU = args.multi_gpu
+    INTERACTIVE_DEVICES = args.devices
+    INTERACTIVE_GPU = int(args.devices.split(",", 1)[0]) if args.multi_gpu else 0
+    INTERACTIVE_RUN_TRAINING = args.run
+
+    run_tag = args.run_tag or datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+    if not run_tag or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for ch in run_tag):
+        raise SystemExit("--run-tag 仅允许英文字母、数字、下划线和连字符")
+    run_root = bridge.TRAINING_READY_ROOT / run_tag
+    if run_root.exists():
+        raise SystemExit(f"训练目录已存在，拒绝覆盖：{run_root}；请换一个 --run-tag")
+    INTERACTIVE_DES = f"{INTERACTIVE_DES}_{run_tag}"
+    INTERACTIVE_CHECKPOINT_ROOT = run_root / "checkpoints"
+
     metadata = bridge.prepare_bridge(
         INTERACTIVE_MODEL_SLUG,
         freq_seconds=INTERACTIVE_FREQ_SECONDS,
@@ -301,13 +365,9 @@ def main() -> int:
         label_len=INTERACTIVE_LABEL_LEN,
         pred_len=INTERACTIVE_PRED_LEN,
         force_refit_scaler=INTERACTIVE_FORCE_REFIT_SCALER,
+        output_root=run_root,
     )
-    ready_dir = bridge.training_ready_dir_for(
-        metadata["model_slug"],
-        int(metadata["freq_seconds"]),
-        int(metadata["seq_len"]),
-        int(metadata["pred_len"]),
-    )
+    ready_dir = Path(metadata["training_ready_dir"])
     cmd = build_command(metadata, ready_dir)
     command_path = ready_dir / "last_train_command.txt"
     write_command_file(command_path, cmd)
@@ -351,6 +411,12 @@ def main() -> int:
     run_started_at = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
     log_path = ready_dir / "training_logs" / f"{INTERACTIVE_MODEL_SLUG}_{run_started_at}.log"
     run_logged_training(cmd, log_path, env)
+    setting = f"{INTERACTIVE_MODEL_SLUG}_{INTERACTIVE_DES}_0"
+    trained_checkpoint = INTERACTIVE_CHECKPOINT_ROOT / setting / "checkpoint.pth"
+    if not trained_checkpoint.is_file():
+        raise FileNotFoundError(f"训练完成但未找到最优 checkpoint: {trained_checkpoint}")
+    shutil.copy2(trained_checkpoint, ready_dir / "checkpoint.pth")
+    print(f"training package checkpoint: {ready_dir / 'checkpoint.pth'}", flush=True)
     return 0
 
 

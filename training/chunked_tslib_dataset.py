@@ -182,6 +182,8 @@ def metadata_file_path(metadata: dict[str, Any]) -> Path:
     raw = Path(metadata["metadata_json"])
     if raw.is_absolute():
         return raw
+    if metadata.get("training_ready_dir"):
+        return Path(metadata["training_ready_dir"]) / raw
     return training_ready_dir_for(
         metadata["model_slug"],
         int(metadata["freq_seconds"]),
@@ -645,6 +647,7 @@ def prepare_bridge(
     label_len: int,
     pred_len: int,
     force_refit_scaler: bool = False,
+    output_root: Path | None = None,
 ) -> dict[str, Any]:
     chunk_root = chunk_root_for(model_slug, freq_seconds, seq_len, pred_len)
     if not chunk_root.exists():
@@ -653,7 +656,9 @@ def prepare_bridge(
             "to the directory containing datasets/chunked, if the dataset is stored elsewhere."
         )
     validate_current_splits(chunk_root)
-    ready_dir = training_ready_dir_for(model_slug, freq_seconds, seq_len, pred_len)
+    ready_dir = (Path(output_root) if output_root is not None else TRAINING_READY_ROOT) / model_dataset_id(
+        model_slug, freq_seconds, seq_len, pred_len
+    )
     scaler_path = ready_dir / "scaler.json"
     metadata_path = ready_dir / "metadata.json"
     yaml_path = ready_dir / "tslib_chunked_config.yaml"
@@ -702,6 +707,7 @@ def prepare_bridge(
     metadata = {
         "model_slug": model_slug,
         "dataset_id": dataset_id,
+        "training_ready_dir": str(ready_dir.resolve()),
         "freq_seconds": freq_seconds,
         "seq_len": seq_len,
         "label_len": label_len,

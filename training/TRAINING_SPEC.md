@@ -90,3 +90,22 @@ model1_xingrong3_<version>/
 ## 7. 接入边界
 
 模型交付不等于自动控制授权。项目后端会先加载 bundle、验证其对应契约，并在 shadow/建议模式下回放。历史发布模型与当前研究训练版本必须分开管理；不得新增或启用真实 DCS 写入。
+
+## 8. 本地 Model 2 重训与系统只读接入
+
+在仓库根目录使用项目 Python 环境运行：
+
+```powershell
+python offline/forecast/training/run_chunked_tslib_training.py --profile model2_10s
+```
+
+默认只准备 Model 2 的新训练目录、冻结 scaler、训练命令和数据加载冒烟报告；每次会使用独立时间标签，不覆盖旧训练包。检查输出后，加 `--run` 才会真正开始训练。默认单卡 0；多卡须显式提供 `--multi-gpu --devices 0,1`。训练会把最优 `checkpoint.pth` 复制回本次独立训练目录，`last_train_command.txt` 保留 `--no_future_covariates` 证明。
+
+训练完成后，在 `backend` 目录运行命令，分别把当前可用的 Model 1 history-only 训练产物和本次 Model 2 训练产物构建为新的只读运行包：
+
+```powershell
+python -m wisburn.cli build-model-candidate --source ..\offline\artifacts\forecast\training_ready\model1_10s_seq120_pred60 --destination ..\offline\artifacts\forecast\runtime_candidates\model1_<版本>
+python -m wisburn.cli build-model-candidate --source ..\offline\artifacts\forecast\training_ready\<本次运行标签>\model2_10s_seq120_pred60 --destination ..\offline\artifacts\forecast\runtime_candidates\model2_<版本>
+```
+
+两个候选包完成契约校验后，在 `backend` 目录通过 `replay-strategy --plant xingrong_3 --model-slug all --mode SHADOW --candidate-model1-bundle <Model1候选包> --candidate-model2-bundle <Model2候选包>` 在同一历史窗口执行合并算法回放。此入口要求同时提供两个模型包，且只接受 SHADOW；它不会修改 Profile 正式包路径、关闭 `retrain_required` 或写入 DCS。
