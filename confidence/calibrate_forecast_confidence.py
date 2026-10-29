@@ -5,6 +5,7 @@ import argparse
 import csv
 import hashlib
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -44,9 +45,9 @@ SPECS = (
     ModelSpec("model1", "model1-10s-v20260823-r1",
               RUNTIME_MODELS / "model1-10s-v20260823-r1" / "model1",
               TRAINING_READY / "model1_xingrong3_model1_10s_trend_endpoint_v1_0"),
-    ModelSpec("model2", "pred600-v20260809-r1",
-              RUNTIME_MODELS / "pred600-v20260809-r1" / "model2",
-              TRAINING_READY / "model2_bundle_source"),
+    ModelSpec("model2", "model2-10s-history-only-v1",
+              ROOT / "offline" / "artifacts" / "forecast" / "runtime_candidates" / "model2_10s_history_only_20261028",
+              TRAINING_READY / "model2_10s_seq120_pred60_history_only"),
 )
 
 
@@ -115,6 +116,40 @@ def read_targets(array: np.ndarray, rows: np.ndarray, horizons: list[int], targe
     return values * scale[None, None, :] + mean[None, None, :]
 
 
+def read_test_origins(source_meta: dict[str, Any], target_columns: list[str]) -> np.ndarray:
+    """Read actual target values at each test window's last historical timestamp."""
+    import pandas as pd
+
+    dataset_id = str(source_meta.get("dataset_id") or "")
+    candidates = [
+        Path(source_meta.get("chunk_root", "")),
+        ROOT / "offline" / "artifacts" / "forecast" / "data_engineering" / "outputs" / "datasets" / "chunked" / dataset_id,
+        ROOT / "offline" / "data" / "model_data_engineering" / "outputs" / "datasets" / "chunked" / dataset_id,
+    ]
+    chunk_root = next((path for path in candidates if path.is_dir()), None)
+    if chunk_root is None:
+        raise FileNotFoundError(f"No local chunked dataset for {dataset_id}; cannot calculate true-origin persistence")
+
+    training_dir = ROOT / "offline" / "forecast" / "training"
+    if str(training_dir) not in sys.path:
+        sys.path.insert(0, str(training_dir))
+    import chunked_tslib_dataset as adapter
+
+    origins, first_future_values = [], []
+    for chunk in adapter.build_chunks(chunk_root, adapter.split_rows(chunk_root, "test")):
+        windows = pd.read_csv(chunk.window_path, encoding="utf-8-sig",
+                              usecols=["input_end_pos", "target_start_pos"])
+        frame = pd.read_parquet(chunk.frame_path, columns=[*target_columns])
+        origin_positions = windows["input_end_pos"].to_numpy(dtype=np.int64)
+        future_positions = windows["target_start_pos"].to_numpy(dtype=np.int64)
+        origins.append(frame.iloc[origin_positions][target_columns].to_numpy(dtype=np.float64))
+        first_future_values.append(frame.iloc[future_positions][target_columns].to_numpy(dtype=np.float64))
+    result = np.concatenate(origins, axis=0) if origins else np.empty((0, len(target_columns)))
+    first_future = (np.concatenate(first_future_values, axis=0) if first_future_values
+                    else np.empty((0, len(target_columns))))
+    return result, first_future
+
+
 def calculate(spec: ModelSpec, max_windows: int | None, batch_size: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     runtime, runtime_meta, source_meta = validate_spec(spec)
     scaler = load_json(spec.source_dir / "scaler.json")
@@ -136,6 +171,17 @@ def calculate(spec: ModelSpec, max_windows: int | None, batch_size: int) -> tupl
         raise ValueError(f"{spec.slug}: target order no longer matches feature columns")
     mean = np.asarray(scaler["mean"], dtype=np.float64)[target_indices]
     scale = np.asarray(scaler["scale"], dtype=np.float64)[target_indices]
+    origins, first_future = read_test_origins(source_meta, targets)
+    if len(origins) == pred.shape[0]:
+        saved_first_future = read_targets(truth, np.arange(pred.shape[0]), [0], target_indices, mean, scale)[:, 0, :]
+        if not np.allclose(first_future, saved_first_future, rtol=1e-4, atol=1e-5):
+            raise ValueError(f"{spec.slug}: saved test arrays do not align with local window order")
+        persistence_source = "observed_value_at_forecast_origin"
+    else:
+        # Some legacy saved predictions were built from a different local dataset revision.
+        # Keep their historical proxy baseline explicit; current Model 2 must use exact origins.
+        origins = read_targets(truth, np.arange(pred.shape[0]), [0], target_indices, mean, scale)[:, 0, :]
+        persistence_source = "first_future_truth_proxy_due_to_window_revision_mismatch"
     rows = selected_indices(pred.shape[0], max_windows)
     split = max(1, min(len(rows) - 1, int(len(rows) * CALIBRATION_FRACTION)))
     calibration_rows, evaluation_rows = rows[:split], rows[split:]
@@ -160,7 +206,7 @@ def calculate(spec: ModelSpec, max_windows: int | None, batch_size: int) -> tupl
         batch = evaluation_rows[begin:begin + batch_size]
         p = read_targets(pred, batch, horizons, target_indices, mean, scale)
         y = read_targets(truth, batch, horizons, target_indices, mean, scale)
-        current = read_targets(truth, batch, [0], target_indices, mean, scale)[:, 0, :]
+        current = origins[batch]
         for target_i in range(len(targets)):
             for horizon_i in range(len(horizons)):
                 error = y[:, horizon_i, target_i] - p[:, horizon_i, target_i]
@@ -204,7 +250,9 @@ def calculate(spec: ModelSpec, max_windows: int | None, batch_size: int) -> tupl
                 "saved_test_coverage": round(saved_coverage, 6) if saved_coverage is not None else None,
                 "release_confidence_cap": release_cap,
                 "input_ood_status": "unavailable", "input_ood_score": None,
-                "limitations": "persistence uses first true future node as current-state proxy; saved input windows unavailable",
+                "persistence_source": persistence_source,
+                "limitations": ("window overlap remains" if persistence_source == "observed_value_at_forecast_origin"
+                                else "saved predictions do not align with current local window revision; persistence uses first future truth as a legacy proxy"),
             })
     manifest = {
         "model_slug": spec.slug, "runtime_version": spec.runtime_version,
@@ -213,7 +261,8 @@ def calculate(spec: ModelSpec, max_windows: int | None, batch_size: int) -> tupl
         "metadata_test_windows": test_windows, "saved_test_coverage": saved_coverage,
         "release_confidence_cap": release_cap,
         "calibration_windows": int(len(calibration_rows)), "evaluation_windows": int(len(evaluation_rows)),
-        "contract": runtime["contract"], "input_ood_status": "unavailable",
+        "contract": runtime["contract"], "persistence_source": persistence_source,
+        "input_ood_status": "unavailable",
     }
     return records, manifest
 
@@ -265,7 +314,7 @@ def write_report(path: Path, rows: list[dict[str, Any]], manifest: dict[str, Any
     for row in rows:
         lines.append(f"| {row['model_slug']} | {row['target_name']} | {row['horizon_seconds']}s | {row['model_mae']:.4f} {row['unit']} | {row['improvement_vs_persistence_proxy']:.1%} | {row['trend_direction_accuracy']:.1%} | {row['interval_coverage']:.1%} | {row['base_confidence']:.3f}/{row['release_confidence']:.3f} | {row['release_confidence_level']} |")
     lines += ["", "## 使用边界", "", "- `low` 表示在相对保持不变的动态收益、方向判断或区间可校准性中至少一项不足；不是目标值一定预测错误。",
-              "- 近端时域的保持不变基线使用首个未来真值代理，须在获得输入历史窗口后复核。",
+              "- Model 2 的保持值基线使用预测起点实测值，并与首个未来真值核对窗口顺序。Model 1 保存预测与当前本地窗口修订不匹配，使用首个未来真值作旧口径代理；其保持值比较不应视为有效基线。",
               "- 后端接入前需要对完整测试回放和典型异常工况进行人工审核；本次输出不自动改变 `Forecast.confidence`。"]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

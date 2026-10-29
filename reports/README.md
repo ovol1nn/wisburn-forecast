@@ -12,3 +12,5 @@
 - `improve_oxygen_history_only.py`：氧量历史/预测缓存与简单偏移试验；`calibrate_oxygen_state.py`：一次三参数状态校准试验；`report_oxygen_diagnostics.py`：生成分时距、案例、时滞及延续/反转诊断。结果保存在forecast artifacts的`candidates/model1_oxygen_corrected_v2_20261022/`，两阶段均未通过完整替换验收，因此没有v2模型bundle。前两个脚本仅在新实验首次运行，冻结记录不覆盖；报告脚本可按缓存复算。所有数据仍在本地，未重训或发布模型。
 
 当前运行版本的置信度校准不放在本目录，见 `../confidence/`。它按目标与时域输出经验预测区间、相对保持不变的动态收益和基础置信度，且不会修改模型权重或后端运行配置。
+
+- `evaluate_model2_no_retrain_correction.py`：不改权重，按目标和10/30/60/120/300/600秒时域在验证期校准模型与保持当前值的混合比例，并在后续测试期比较原模型、保持值和混合预测；同时记录MAE、RMSE及误差尾部，并说明与MPC滚动残差校正的组合顺序。报告输出到`offline/artifacts/forecast/candidates/model2_history_only_blend_20261028_v3/`，不接入运行配置。

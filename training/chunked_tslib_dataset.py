@@ -255,7 +255,24 @@ def infer_columns(chunk_root: Path, model_slug: str, freq_seconds: int) -> tuple
 
     target_candidates, _ = load_build_specs(model_slug)
     bad_targets = unusable_output_codes(model_slug, freq_seconds)
-    target_columns = [c for c in target_candidates if c in feature_columns and c not in bad_targets]
+    contract = bmd.load_model_contract(model_slug)
+    target_columns = list(contract["target_columns"])
+    missing_targets = [c for c in target_columns if c not in feature_columns]
+    invalid_roles = [c for c in target_columns if c not in target_candidates]
+    excluded_targets = [c for c in target_columns if c in bad_targets]
+    if missing_targets or invalid_roles or excluded_targets:
+        raise SystemExit(
+            f"{model_slug} 输出列不符合统一契约：missing={missing_targets}, "
+            f"wrong_role={invalid_roles}, unusable={excluded_targets}"
+        )
+    if len(feature_columns) != int(contract["feature_count"]):
+        raise SystemExit(
+            f"{model_slug} 输入列数 {len(feature_columns)} 与统一契约 {contract['feature_count']} 不一致"
+        )
+    optional = list(contract["missing_input_policy"].get("columns") or [])
+    missing_optional = [c for c in optional if c not in feature_columns]
+    if missing_optional:
+        raise SystemExit(f"{model_slug} 缺失策略点不在训练特征中: {missing_optional}")
     if not target_columns:
         raise SystemExit(f"No usable target columns found for {model_slug}.")
     return feature_columns, target_columns
@@ -361,12 +378,15 @@ def drop_near_constant_train_inputs(
     feature_columns: list[str],
     target_columns: list[str],
     scaler: StandardScaler,
+    preserve_columns: set[str] | None = None,
 ) -> tuple[list[str], StandardScaler, list[str]]:
     target_set = set(target_columns)
+    preserve = set(preserve_columns or ())
     kept_indices: list[int] = []
     dropped: list[str] = []
     for idx, column in enumerate(feature_columns):
-        if column not in target_set and float(scaler.scale[idx]) <= NEAR_CONSTANT_TRAIN_SCALE:
+        if (column not in target_set and column not in preserve
+                and float(scaler.scale[idx]) <= NEAR_CONSTANT_TRAIN_SCALE):
             dropped.append(column)
         else:
             kept_indices.append(idx)
@@ -460,6 +480,7 @@ class ChunkedWindowDataset(Dataset):
         seq_len: int,
         label_len: int,
         pred_len: int,
+        missing_input_columns: list[str] | None = None,
         max_windows: int | None = None,
         cache_size: int = 4,
     ) -> None:
@@ -474,6 +495,11 @@ class ChunkedWindowDataset(Dataset):
         self.seq_len = int(seq_len)
         self.label_len = int(label_len)
         self.pred_len = int(pred_len)
+        self.missing_input_columns = list(missing_input_columns or [])
+        unknown_missing = sorted(set(self.missing_input_columns) - set(self.feature_columns))
+        if unknown_missing:
+            raise ValueError(f"Missing-input policy columns are absent from features: {unknown_missing}")
+        self.missing_input_indices = [self.feature_columns.index(c) for c in self.missing_input_columns]
         self.cache_size = max(1, int(cache_size))
         self.chunks = build_chunks(
             self.chunk_root,
@@ -534,6 +560,12 @@ class ChunkedWindowDataset(Dataset):
 
         seq_x = seq_x_frame[self.feature_columns].to_numpy(dtype="float32", copy=False)
         seq_y = seq_y_frame[self.feature_columns].to_numpy(dtype="float32", copy=False)
+        if self.missing_input_indices:
+            seq_x = seq_x.copy()
+            seq_y = seq_y.copy()
+            means = self.scaler.mean[self.missing_input_indices]
+            seq_x[:, self.missing_input_indices] = means
+            seq_y[:, self.missing_input_indices] = means
         seq_x = self.scaler.transform(seq_x)
         seq_y = self.scaler.transform(seq_y)
         seq_x_mark = time_features(seq_x_frame["timestamp"])
@@ -664,10 +696,13 @@ def prepare_bridge(
     yaml_path = ready_dir / "tslib_chunked_config.yaml"
 
     candidate_columns, target_columns = infer_columns(chunk_root, model_slug, freq_seconds)
-    expected_targets = {"model1": 14, "model2": 5}.get(model_slug)
-    if expected_targets is not None and len(target_columns) != expected_targets:
+    model_contract = bmd.load_model_contract(model_slug)
+    missing_input_columns = list(model_contract["missing_input_policy"].get("columns") or [])
+    preserve_columns = set(missing_input_columns)
+    expected_targets = list(model_contract["target_columns"])
+    if target_columns != expected_targets:
         raise SystemExit(
-            f"{model_slug} has {len(target_columns)} usable targets; expected {expected_targets}. "
+            f"{model_slug} target_columns does not match the registered output order. "
             "Check the point configuration and unusable-output report before training."
         )
     feature_columns = list(candidate_columns)
@@ -676,7 +711,7 @@ def prepare_bridge(
         scaler = load_scaler(scaler_path)
         if scaler.columns == feature_columns:
             feature_columns, scaler, dropped_near_constant_inputs = drop_near_constant_train_inputs(
-                feature_columns, target_columns, scaler
+                feature_columns, target_columns, scaler, preserve_columns=preserve_columns
             )
             if dropped_near_constant_inputs:
                 save_scaler(scaler_path, scaler)
@@ -685,19 +720,36 @@ def prepare_bridge(
             dropped_near_constant_inputs = [
                 column for column in candidate_columns if column not in feature_columns
             ]
+            missing_policy_dropped = sorted(preserve_columns - set(feature_columns))
+            if missing_policy_dropped:
+                scaler = fit_scaler(chunk_root, candidate_columns)
+                feature_columns = list(candidate_columns)
+                feature_columns, scaler, dropped_near_constant_inputs = drop_near_constant_train_inputs(
+                    feature_columns, target_columns, scaler, preserve_columns=preserve_columns
+                )
+                save_scaler(scaler_path, scaler)
         else:
             print("scaler columns changed; refitting scaler", flush=True)
             scaler = fit_scaler(chunk_root, feature_columns)
             feature_columns, scaler, dropped_near_constant_inputs = drop_near_constant_train_inputs(
-                feature_columns, target_columns, scaler
+                feature_columns, target_columns, scaler, preserve_columns=preserve_columns
             )
             save_scaler(scaler_path, scaler)
     else:
         scaler = fit_scaler(chunk_root, feature_columns)
         feature_columns, scaler, dropped_near_constant_inputs = drop_near_constant_train_inputs(
-            feature_columns, target_columns, scaler
+            feature_columns, target_columns, scaler, preserve_columns=preserve_columns
         )
         save_scaler(scaler_path, scaler)
+
+    if len(feature_columns) != int(model_contract["feature_count"]):
+        raise SystemExit(
+            f"{model_slug} 输入列数 {len(feature_columns)} 与统一契约 "
+            f"{model_contract['feature_count']} 不一致；请重建训练帧/冻结 scaler。"
+        )
+    missing_policy_dropped = sorted(preserve_columns - set(feature_columns))
+    if missing_policy_dropped:
+        raise SystemExit(f"{model_slug} 缺失策略输入未保留: {missing_policy_dropped}")
 
     target_indices = [feature_columns.index(c) for c in target_columns]
     split_summary_path = chunk_root / "splits" / "split_summary.csv"
@@ -720,6 +772,10 @@ def prepare_bridge(
         "target_columns": target_columns,
         "target_indices": target_indices,
         "n_vars": len(feature_columns),
+        "history_only": True,
+        "no_future_covariates": True,
+        "missing_input_policy": dict(model_contract["missing_input_policy"]),
+        "preprocessing_policy": "strict_raw_complete_windows_v1",
         "time_feature_dim": 6,
         "split_summary": split_summary,
         "dropped_near_constant_train_inputs": dropped_near_constant_inputs,
@@ -757,6 +813,7 @@ def get_datasets(
             seq_len=int(metadata["seq_len"]),
             label_len=int(metadata["label_len"]),
             pred_len=int(metadata["pred_len"]),
+            missing_input_columns=list((metadata.get("missing_input_policy") or {}).get("columns") or []),
             max_windows=max_windows,
             cache_size=cache_size,
         )

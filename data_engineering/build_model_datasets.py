@@ -932,9 +932,15 @@ def quality_summary(pd: Any, df: Any, point_codes: list[str], cfg: dict[str, Any
     return pd.DataFrame(rows)
 
 
-def low_information_inputs(pd: Any, quality: Any, specs: list[VariableSpec], cfg: dict[str, Any]) -> Any:
+def low_information_inputs(
+    pd: Any,
+    quality: Any,
+    specs: list[VariableSpec],
+    cfg: dict[str, Any],
+    preserve_point_codes: Iterable[str] = (),
+) -> Any:
     input_codes = {s.point_code for s in specs if is_input_role(s.io_type)}
-    keep_codes = set(cfg.get("low_information_keep_point_codes", []))
+    keep_codes = set(cfg.get("low_information_keep_point_codes", [])) | set(preserve_point_codes)
     rows = []
     for _, row in quality.iterrows():
         code = row.get("point_code")
@@ -1072,10 +1078,13 @@ def detect_excluded_windows(
     model_point_codes: list[str],
     *,
     freq_seconds: int,
+    optional_missing_input_codes: Iterable[str] = (),
 ) -> Any:
     masks = []
     reasons = []
-    existing = [c for c in model_point_codes if c in df.columns]
+    optional_missing = set(optional_missing_input_codes)
+    effective_codes = [c for c in model_point_codes if c not in optional_missing]
+    existing = [c for c in effective_codes if c in df.columns]
     if existing:
         collective_missing = df[existing].isna().mean(axis=1)
         masks.append(collective_missing >= float(cfg.get("collective_missing_rate_warn", 0.4)))
@@ -1111,6 +1120,7 @@ def long_common_low_anomaly(
     model_point_codes: list[str],
     *,
     freq_seconds: int,
+    optional_missing_input_codes: Iterable[str] = (),
 ) -> tuple[Any, Any, Any]:
     settings = cfg.get("long_common_low_anomaly", {})
     empty_windows = pd.DataFrame(columns=["start_time", "end_time", "rows", "duration_seconds", "reason"])
@@ -1124,7 +1134,10 @@ def long_common_low_anomaly(
     zero_abs_tolerance = float(cfg.get("zero_abs_tolerance", 1e-9))
     candidate_rows = []
     low_flags = []
+    optional_missing = set(optional_missing_input_codes)
     for code in unique_in_order(model_point_codes):
+        if code in optional_missing:
+            continue
         if code not in df.columns:
             continue
         s = df[code]
@@ -1214,13 +1227,19 @@ def build_training_mask(
     common_low_score: Any | None = None,
     model: str | None = None,
     exclude_model_codes: Iterable[str] = (),
+    optional_missing_input_codes: Iterable[str] = (),
 ) -> Any:
     mask = pd.DataFrame({"timestamp": df["timestamp"]})
     excluded = set(exclude_model_codes)
+    optional_missing = set(optional_missing_input_codes)
+    invalid_optional = optional_missing.intersection(output_codes)
+    if invalid_optional:
+        raise ValueError(f"预测目标不能设为可缺失输入: {sorted(invalid_optional)}")
     required_codes = unique_in_order(
-        [code for code in model_point_codes if code not in excluded]
+        [code for code in model_point_codes if code not in excluded and code not in optional_missing]
         + (list(derived_source_codes(cfg)) + derived_feature_names(cfg) if model == "子模型1" else [])
     )
+    required_codes = [code for code in required_codes if code not in optional_missing]
     missing_columns = set(required_codes) - set(df.columns)
     existing = [c for c in required_codes if c in df.columns]
     if existing:
@@ -1394,6 +1413,17 @@ def model_slug(model: str) -> str:
     return model.replace("子模型", "model")
 
 
+def load_model_contract(slug: str) -> dict[str, Any]:
+    """Read the shared model contract; training must not maintain a second copy."""
+    registry_path = WORKSPACE_ROOT / "contracts" / "configuration" / "model_contracts.json"
+    with registry_path.open("r", encoding="utf-8") as handle:
+        registry = json.load(handle)
+    contract = registry.get("models", {}).get(str(slug).strip().lower())
+    if not isinstance(contract, dict):
+        raise ValueError(f"模型契约未登记: {slug}")
+    return contract
+
+
 def time_label(value: Any) -> str:
     return str(value).replace(":", "").replace("-", "").replace(" ", "T")
 
@@ -1405,6 +1435,15 @@ def downcast_numeric_frame(df: Any) -> Any:
             continue
         if str(out[col].dtype).startswith("float"):
             out[col] = out[col].astype("float32")
+    return out
+
+
+def ensure_policy_columns(pd: Any, df: Any, columns: Iterable[str]) -> Any:
+    """Keep contract-approved sparse features in the frame even when no source file exists."""
+    out = df.copy()
+    for column in columns:
+        if column not in out.columns:
+            out[column] = float("nan")
     return out
 
 
@@ -1519,8 +1558,14 @@ def build_model_dataset_chunked(
     paths = apply_cache_range(make_output_dirs(cfg, freq_seconds), freq_seconds, start, end)
     model_specs = [s for s in specs if s.model == model]
     model_codes = unique_in_order([s.point_code for s in model_specs])
-    all_codes = unique_in_order(model_codes + sorted(derived_source_codes(cfg)))
     slug = model_slug(model)
+    model_contract = load_model_contract(slug)
+    optional_missing = list(model_contract["missing_input_policy"].get("columns") or [])
+    invalid_optional = sorted(set(optional_missing) - set(model_codes))
+    if invalid_optional:
+        raise SystemExit(f"{slug} 缺失策略点未登记为模型输入: {invalid_optional}")
+    effective_model_codes = [code for code in model_codes if code not in set(optional_missing)]
+    all_codes = unique_in_order(model_codes + sorted(derived_source_codes(cfg)))
     total_len = int(seq_len) + int(pred_len)
     if total_len <= 0:
         raise SystemExit("seq_len + pred_len 必须大于 0。")
@@ -1547,7 +1592,7 @@ def build_model_dataset_chunked(
     )
     q_path = report_path(paths, "quality", f"{slug}_quality_{freq_seconds}s{report_range_suffix}.csv", slug)
     q.to_csv(q_path, index=False, encoding="utf-8-sig")
-    low_info = low_information_inputs(pd, q, model_specs, cfg)
+    low_info = low_information_inputs(pd, q, model_specs, cfg, preserve_point_codes=optional_missing)
     low_info_path = report_path(paths, "quality", f"low_information_inputs_{slug}_{freq_seconds}s{report_range_suffix}.csv", slug)
     low_info.to_csv(low_info_path, index=False, encoding="utf-8-sig")
     bad_outputs = unusable_outputs(pd, q, model_specs, cfg)
@@ -1596,6 +1641,7 @@ def build_model_dataset_chunked(
                 "input_forward_fill_limit": cfg_value(cfg, "input_forward_fill_limit", 30, model),
                 "input_spike_filter": cfg.get("input_spike_filter", {}),
                 "model_preprocessing_policy": cfg.get("model_preprocessing_policy", "legacy"),
+                "missing_input_policy": model_contract["missing_input_policy"],
                 "training_exclusion_buffer_seconds": cfg_value(cfg, "training_exclusion_buffer_seconds", 0, model),
                 "shutdown_indicators": cfg.get("shutdown_indicators", []),
                 "quantile_outlier_filter": cfg.get("quantile_outlier_filter", {}),
@@ -1626,6 +1672,7 @@ def build_model_dataset_chunked(
             end=load_end,
             check_size=False,
         )
+        wide = ensure_policy_columns(pd, wide, optional_missing)
         wide, derived_notes = add_derived_features(pd, wide, cfg)
         quantile_audit = []
         input_spike_audit = []
@@ -1650,8 +1697,9 @@ def build_model_dataset_chunked(
             pd,
             wide,
             cfg,
-            model_codes,
+            effective_model_codes,
             freq_seconds=freq_seconds,
+            optional_missing_input_codes=optional_missing,
         )
         training_mask = build_training_mask(
             pd,
@@ -1663,6 +1711,7 @@ def build_model_dataset_chunked(
             common_low_score=common_low_score,
             model=model,
             exclude_model_codes=stable_drop_cols + stable_bad_outputs,
+            optional_missing_input_codes=optional_missing,
         )
         training_frame = wide.copy()
         training_frame["valid_for_training"] = training_mask["valid_for_training"].to_numpy()
@@ -1692,7 +1741,10 @@ def build_model_dataset_chunked(
             window_index.insert(1, "frame_path", str(frame_path))
         window_index.to_csv(window_path, index=False, encoding="utf-8-sig")
 
-        windows = detect_excluded_windows(pd, wide, cfg, model_codes, freq_seconds=freq_seconds)
+        windows = detect_excluded_windows(
+            pd, wide, cfg, effective_model_codes, freq_seconds=freq_seconds,
+            optional_missing_input_codes=optional_missing,
+        )
         buffered_windows = boolean_windows(
             pd,
             training_mask["timestamp"],
@@ -1793,8 +1845,16 @@ def build_model_dataset(
         if spec.point_code not in seen:
             seen.add(spec.point_code)
             model_codes.append(spec.point_code)
+    model_slug = model.replace("子模型", "model")
+    model_contract = load_model_contract(model_slug)
+    optional_missing = list(model_contract["missing_input_policy"].get("columns") or [])
+    invalid_optional = sorted(set(optional_missing) - set(model_codes))
+    if invalid_optional:
+        raise SystemExit(f"{model_slug} 缺失策略点未登记为模型输入: {invalid_optional}")
+    effective_model_codes = [code for code in model_codes if code not in set(optional_missing)]
     print(f"build wide table for {model}: {len(model_codes)} model points", flush=True)
     wide = merge_wide_table(pd, paths, unique_in_order(model_codes + sorted(derived_source_codes(cfg))), cfg)
+    wide = ensure_policy_columns(pd, wide, optional_missing)
     wide, derived_notes = add_derived_features(pd, wide, cfg)
     quantile_audit = []
     input_spike_audit = []
@@ -1808,7 +1868,6 @@ def build_model_dataset(
         input_spike_audit=input_spike_audit,
     )
 
-    model_slug = model.replace("子模型", "model")
     data_path = paths["datasets"] / f"{model_slug}_{freq_seconds}s.parquet"
     write_dataset(pd, wide, data_path)
 
@@ -1826,7 +1885,7 @@ def build_model_dataset(
         encoding="utf-8-sig",
     )
 
-    low_info = low_information_inputs(pd, q, model_specs, cfg)
+    low_info = low_information_inputs(pd, q, model_specs, cfg, preserve_point_codes=optional_missing)
     low_info_path = report_path(paths, "quality", f"low_information_inputs_{model_slug}_{freq_seconds}s.csv", model_slug)
     low_info.to_csv(low_info_path, index=False, encoding="utf-8-sig")
     bad_outputs = unusable_outputs(pd, q, model_specs, cfg)
@@ -1841,8 +1900,9 @@ def build_model_dataset(
         pd,
         wide,
         cfg,
-        model_codes,
+        effective_model_codes,
         freq_seconds=freq_seconds,
+        optional_missing_input_codes=optional_missing,
     )
     common_low_score_path = report_path(paths, "screening", f"common_low_score_{model_slug}_{freq_seconds}s.parquet", model_slug)
     write_dataset(pd, common_low_score, common_low_score_path)
@@ -1861,6 +1921,7 @@ def build_model_dataset(
         common_low_score=common_low_score,
         model=model,
         exclude_model_codes=(low_info["point_code"].tolist() if not low_info.empty else []) + stable_bad_outputs,
+        optional_missing_input_codes=optional_missing,
     )
     training_frame = wide.copy()
     training_frame["valid_for_training"] = training_mask["valid_for_training"].to_numpy()
@@ -1880,7 +1941,10 @@ def build_model_dataset(
     mask_path = report_path(paths, "screening", f"training_mask_{model_slug}_{freq_seconds}s.parquet", model_slug)
     write_dataset(pd, training_mask, mask_path)
 
-    windows = detect_excluded_windows(pd, wide, cfg, model_codes, freq_seconds=freq_seconds)
+    windows = detect_excluded_windows(
+        pd, wide, cfg, effective_model_codes, freq_seconds=freq_seconds,
+        optional_missing_input_codes=optional_missing,
+    )
     w_path = report_path(paths, "screening", f"excluded_time_windows_{model_slug}_{freq_seconds}s.csv", model_slug)
     windows.to_csv(w_path, index=False, encoding="utf-8-sig")
 
